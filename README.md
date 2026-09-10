@@ -1,20 +1,96 @@
-# 📌 Overview
+<p align="center">
+  <pre>
+        ·   ✦   .   ✦   ·
+    .   ╭───────────────╮   .
+  ✦   ╱                   ╲   ✦
+     ╱   your context,     ╲
+    ╱    compressed.        ╲
+     ╲                     ╱
+      ╲───────────────────╱
+        ·   ✦   .   ✦   ·
+  </pre>
+</p>
 
-This filter reduces token consumption in long conversations through intelligent summarization and message compression while maintaining conversational coherence.
+<h1 align="center">🕳️ Async Context Compression</h1>
 
-## Core Features
+<p align="center">
+  <strong>Long conversations, finite context windows.</strong><br/>
+  This filter feeds the middle of your chat to the black hole — and keeps everything that matters.
+</p>
 
-- ✅ Automatic compression triggered by token count threshold
-- ✅ Asynchronous summary generation (does not block user response)
-- ✅ Persistent storage with database support (PostgreSQL and SQLite)
-- ✅ Flexible retention policy (keep first N non-system messages + last N messages)
-- ✅ Absolute system message protection (never compressed or discarded)
-- ✅ Structure-aware trimming to preserve document skeleton
-- ✅ Native tool output trimming for function calling support
+<p align="center">
+  <a href="https://img.shields.io/badge/version-1.6.1-blue">
+    <img src="https://img.shields.io/badge/version-1.6.1-blue" alt="Version"/>
+  </a>
+  <a href="https://img.shields.io/badge/license-MIT-green">
+    <img src="https://img.shields.io/badge/license-MIT-green" alt="License"/>
+  </a>
+  <a href="https://img.shields.io/badge/Open_WebUI-Filter-purple">
+    <img src="https://img.shields.io/badge/Open_WebUI-Filter-purple" alt="Open WebUI"/>
+  </a>
+</p>
 
-## 🔄 Workflow
+---
 
-### Phase 1: Inlet (Pre-request processing)
+## 📖 Contents
+
+- [Why?](#why)
+- [✨ Core Features](#-core-features)
+- [🔄 How It Works](#-how-it-works)
+- [📊 Before & After](#-before--after)
+- [🛡️ System Message Protection](#️-system-message-protection)
+- [🚀 Quick Start](#-quick-start)
+- [⚙️ Configuration](#️-configuration)
+- [💾 Storage](#-storage)
+- [🔧 Deployment](#-deployment)
+- [📝 Database Query Examples](#-database-query-examples)
+- [⚠️ Important Notes](#️-important-notes)
+- [🐛 Troubleshooting](#-troubleshooting)
+- [🙏 Credits](#-credits)
+- [📄 License](#-license)
+
+## Why?
+
+Every long chat is a slow leak: the same history is re-sent on **every single request**, and token bills (and latency) climb until you hit the context wall.
+
+Naive fixes — truncating the oldest messages, or re-summarizing on the fly — destroy the initial prompt and the recent conversation, and block the response while they work.
+
+This filter does it properly:
+
+> 🕳️ **Compress the middle, keep the bookends, summarize in the background.**
+> The first messages (your setup, your rules) and the last messages (what you're actually doing) survive untouched. Everything in between becomes a tight summary — generated *after* the response, so you never wait for it.
+
+## ✨ Core Features
+
+| | Feature |
+| --- | --- |
+| ⚡ | **Automatic** — compression triggers on a token threshold, no user action needed |
+| 🌗 | **Asynchronous** — summary generation never blocks the user's response |
+| 💾 | **Persistent** — summaries stored in Open WebUI's own database (PostgreSQL, SQLite, …) |
+| 🎚️ | **Flexible retention** — keep first N non-system messages + last N messages |
+| 🛡️ | **System message protection** — system prompts are *never* compressed or discarded |
+| 🏗️ | **Structure-aware trimming** — preserves document skeletons when hard-trimming |
+| 🔧 | **Tool output trimming** — tames huge native function-calling results |
+| 🖼️ | **Multimodal-safe** — images survive compression; only text is summarized |
+| 🌍 | **i18n** — UI strings in English & 中文 |
+
+## 🔄 How It Works
+
+```mermaid
+flowchart LR
+    A["📨 Request arrives<br/>20 messages"] --> B{"summary<br/>exists?"}
+    B -- "yes" --> C["🕳️ Inlet: keep first + last,<br/>inject summary in the middle"]
+    B -- "no" --> D["send as-is"]
+    C --> E["🤖 LLM responds"]
+    D --> E
+    E --> F{"threshold<br/>reached?"}
+    F -- "no" --> G["done"]
+    F -- "yes" --> H["📝 Outlet: async background task<br/>summarizes the middle"]
+    H --> I["💾 summary saved to DB"]
+    I --> G
+```
+
+### Phase 1 — Inlet (pre-request)
 
 1. Receives all messages in the current conversation.
 2. Checks for a previously saved summary.
@@ -25,7 +101,7 @@ This filter reduces token consumption in long conversations through intelligent 
    - Combines them into: `[Kept First + Summary + Gap System Messages + Kept Last]`
 4. Sends the compressed message list to the LLM.
 
-### Phase 2: Outlet (Post-response processing)
+### Phase 2 — Outlet (post-response)
 
 1. Triggered after the LLM response is complete.
 2. Checks if the token count has reached the compression threshold.
@@ -33,6 +109,24 @@ This filter reduces token consumption in long conversations through intelligent 
    - Extracts messages to be summarized (excluding the kept first and last).
    - Calls the LLM to generate a concise summary.
    - Saves the summary to the database.
+
+## 📊 Before & After
+
+A 20-message conversation (defaults: keep first 0, keep last 6):
+
+```
+BEFORE   [🧠 initial prompt] [💬💬💬💬💬💬💬💬💬💬💬💬💬💬 14 messages of history] [💬💬💬💬💬💬 6 recent]
+          ──────────────────────────────────────────────────────────────────────────────────────────
+          20 messages · ~64k tokens re-sent on every request
+
+AFTER    [🧠 initial prompt + 📝 one tight summary] [💬💬💬💬💬💬 6 recent]
+          ──────────────────────────────────────────────────────────────────────────────────────────
+           7 messages · ~65% smaller · full context retained
+```
+
+- ✓ Saves 13 messages (approx. 65%)
+- ✓ Retains full context
+- ✓ Protects important initial prompts
 
 ## 🛡️ System Message Protection
 
@@ -57,49 +151,14 @@ Preserved from gap: [sys, sys(injected)]
 Final output: [sys, summary, sys(injected), user10, user11]
 ```
 
-## 💾 Storage
+## 🚀 Quick Start
 
-This filter uses Open WebUI's shared database connection for persistent storage. It automatically reuses Open WebUI's internal SQLAlchemy engine and `SessionLocal`, making the plugin database-agnostic and ensuring compatibility with any database backend that Open WebUI supports (PostgreSQL, SQLite, etc.).
+1. Grab [`v1.6.1.py`](./v1.6.1.py) — it's a single file, no dependencies to install.
+2. In Open WebUI: **Admin Panel → Settings → Filters → New Filter**.
+3. Paste the file contents. The title, description, and version auto-fill from the metadata header.
+4. Save and enable. That's it — the `chat_summary` table is created automatically on first run.
 
-No additional database configuration is required — the plugin inherits Open WebUI's database settings automatically.
-
-**Table Structure (`chat_summary`):**
-
-| Column | Description |
-| --- | --- |
-| `id` | Primary Key (auto-increment) |
-| `chat_id` | Unique chat identifier (indexed) |
-| `summary` | The summary content (TEXT) |
-| `compressed_message_count` | The original number of messages |
-| `created_at` | Timestamp of creation |
-| `updated_at` | Timestamp of last update |
-
-## 📊 Compression Example
-
-Scenario: a 20-message conversation (default settings: keep first 0, keep last 6).
-
-**Before compression:**
-
-```
-Message 1:     [Initial prompt + First question]
-Messages 2-14: [Historical conversation]
-Messages 15-20: [Recent conversation]
-Total: 20 full messages
-```
-
-**After compression:**
-
-```
-Message 1:     [Initial prompt + Historical summary + First question]
-Messages 15-20: [Last 6 full messages]
-Total: 7 messages
-```
-
-**Effect:**
-
-- ✓ Saves 13 messages (approx. 65%)
-- ✓ Retains full context
-- ✓ Protects important initial prompts
+> 💡 **Tip:** point `summary_model` at a fast, cheap model (e.g. `gemini-2.5-flash`, `gpt-4.1`) so summaries cost almost nothing.
 
 ## ⚙️ Configuration
 
@@ -121,6 +180,23 @@ Total: 7 messages
 | `token_usage_status_threshold` | `80` | Only show token usage status when usage exceeds this percentage (0-100). Set to 0 to always show. |
 | `debug_mode` | `false` | Enable detailed logging for debugging. Recommended to set to `false` in production. |
 | `show_debug_log` | `false` | Show debug logs in the frontend console (F12). Useful for frontend debugging. |
+
+## 💾 Storage
+
+This filter uses Open WebUI's shared database connection for persistent storage. It automatically reuses Open WebUI's internal SQLAlchemy engine and `SessionLocal`, making the plugin database-agnostic and ensuring compatibility with any database backend that Open WebUI supports (PostgreSQL, SQLite, etc.).
+
+No additional database configuration is required — the plugin inherits Open WebUI's database settings automatically.
+
+**Table Structure (`chat_summary`):**
+
+| Column | Description |
+| --- | --- |
+| `id` | Primary Key (auto-increment) |
+| `chat_id` | Unique chat identifier (indexed) |
+| `summary` | The summary content (TEXT) |
+| `compressed_message_count` | The original number of messages |
+| `created_at` | Timestamp of creation |
+| `updated_at` | Timestamp of last update |
 
 ## 🔧 Deployment
 
@@ -227,4 +303,4 @@ This project builds on and is inspired by:
 
 ## 📄 License
 
-MIT
+MIT — do whatever, just keep the license.

@@ -1,12 +1,14 @@
-"""
-Async Context Compression — Open WebUI filter.
-
-Reduces token consumption in long conversations via intelligent summarization
-and message compression. See README.md for full documentation, configuration,
-deployment notes, and troubleshooting.
-
-version: 1.6.1 | license: MIT | author: Fu-Jie
-"""
+---
+title: Async Context Compression
+id: async_context_compression
+author: Fu-Jie
+author_url: https://github.com/Fu-Jie/openwebui-extensions
+funding_url: https://github.com/open-webui
+description: Reduces token consumption in long conversations while maintaining coherence through intelligent summarization and message compression.
+version: 1.6.1
+openwebui_id: b1655bc8-6de9-4cad-8cb5-a6f7829a02ce
+license: MIT
+---
 
 
 from pydantic import BaseModel, Field

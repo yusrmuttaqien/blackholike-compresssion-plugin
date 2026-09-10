@@ -210,6 +210,38 @@ It is recommended to set the priority of this filter relatively high (a smaller 
 2. This compression filter (`priority = 10`).
 3. Filters that run after compression (priority > 10) — e.g., a final output formatting filter.
 
+## 🧩 Development & Building
+
+Open WebUI loads a **single** `.py` file, but this plugin is developed as **modular fragments** in `src/` for readability and maintainability. `build.py` assembles them back into the single `v1.6.1.py` you paste into OWUI.
+
+### Module map (`src/`)
+
+| File | What lives there |
+|------|------------------|
+| `_header.py` | Module docstring, all imports, `logger`, shared constants |
+| `i18n.py` | `TRANSLATIONS` + `I18nMixin` (language resolution, translation lookup) |
+| `tokens.py` | Token counting (tiktoken + fast estimator) + `TokenMixin` |
+| `db.py` | DB engine/schema discovery, `ChatSummary` model, sessions, summary persistence (`DBMixin`) |
+| `toolcalls.py` | Native tool-call normalization, output trimming, atomic grouping (`ToolCallMixin`) |
+| `compression.py` | History reconstruction, thresholds, compression orchestration (`CompressionMixin`) |
+| `summarize.py` | Summary prompt building + LLM call (`SummarizeMixin`) |
+| `externalrefs.py` | Cross-chat reference loading/injection (`ExternalRefsMixin`) |
+| `console.py` | Frontend console logging + status (`ConsoleMixin`) |
+| `filter.py` | `class Filter` — inherits all mixins; holds `__init__`, `Valves`, `inlet`, `outlet` |
+
+The `Filter` class is split across **mixins** (one per concern); `filter.py` ties them together. Each fragment is a plain file that shares the imports/constants from `_header.py` — they are **not** importable standalone, only the built `v1.6.1.py` is.
+
+### Workflow
+
+```bash
+# 1. Edit the relevant fragment(s) in src/
+# 2. Rebuild the single deployable file
+python build.py
+# 3. Paste the regenerated v1.6.1.py into Open WebUI
+```
+
+`build.py` concatenates the fragments in dependency order (header first, `Filter` last) and verifies nothing is missing. The built file is functionally identical to the sum of its fragments — every method body is preserved verbatim.
+
 ## 📝 Database Query Examples
 
 View all summaries:

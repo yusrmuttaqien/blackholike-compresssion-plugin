@@ -1,4 +1,4 @@
----
+"""
 title: Async Context Compression
 id: async_context_compression
 author: Fu-Jie
@@ -8,7 +8,7 @@ description: Reduces token consumption in long conversations while maintaining c
 version: 1.6.1
 openwebui_id: b1655bc8-6de9-4cad-8cb5-a6f7829a02ce
 license: MIT
----
+"""
 
 
 from pydantic import BaseModel, Field
@@ -60,140 +60,9 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.engine import Engine
 from datetime import datetime, timezone
 
-
-def _discover_owui_engine(db_module: Any) -> Optional[Engine]:
-    """Discover the Open WebUI SQLAlchemy engine via provided db module helpers."""
-    if db_module is None:
-        return None
-
-    db_context = getattr(db_module, "get_db_context", None) or getattr(
-        db_module, "get_db", None
-    )
-    if callable(db_context):
-        try:
-            with db_context() as session:
-                try:
-                    return session.get_bind()
-                except AttributeError:
-                    return getattr(session, "bind", None) or getattr(
-                        session, "engine", None
-                    )
-        except Exception as exc:
-            logger.error(f"[DB Discover] get_db_context failed: {exc}")
-
-    for attr in ("engine", "ENGINE", "bind", "BIND"):
-        candidate = getattr(db_module, attr, None)
-        if candidate is not None:
-            return candidate
-
-    return None
-
-
-def _discover_owui_schema(db_module: Any) -> Optional[str]:
-    """Discover the Open WebUI database schema name if configured."""
-    if db_module is None:
-        return None
-
-    try:
-        base = getattr(db_module, "Base", None)
-        metadata = getattr(base, "metadata", None) if base is not None else None
-        candidate = getattr(metadata, "schema", None) if metadata is not None else None
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    except Exception as exc:
-        logger.error(f"[DB Discover] Base metadata schema lookup failed: {exc}")
-
-    try:
-        metadata_obj = getattr(db_module, "metadata_obj", None)
-        candidate = (
-            getattr(metadata_obj, "schema", None) if metadata_obj is not None else None
-        )
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    except Exception as exc:
-        logger.error(f"[DB Discover] metadata_obj schema lookup failed: {exc}")
-
-    try:
-        from open_webui import env as owui_env
-
-        candidate = getattr(owui_env, "DATABASE_SCHEMA", None)
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    except Exception as exc:
-        logger.error(f"[DB Discover] env schema lookup failed: {exc}")
-
-    return None
-
-
-owui_engine = _discover_owui_engine(owui_db)
-owui_schema = _discover_owui_schema(owui_db)
-owui_Base = getattr(owui_db, "Base", None) if owui_db is not None else None
-if owui_Base is None:
-    owui_Base = declarative_base()
-
-# ── OpenWebUI version detection for async DB compatibility ──────────
-try:
-    from open_webui.env import VERSION as _owui_version
-except ImportError:
-    _owui_version = "0.0.0"
-
-
-def _owui_version_ge(threshold: str) -> bool:
-    """Return True if open_webui_version >= threshold (e.g. '0.9.0')."""
-    try:
-        v = [int(x) for x in _owui_version.split(".")[:3]]
-        t = [int(x) for x in threshold.split(".")[:3]]
-        return v >= t
-    except (ValueError, TypeError):
-        return False
-
-
-async def _call_db(method, *args, **kwargs):
-    """
-    Call an OpenWebUI DB model method with version-aware async handling.
-    - OpenWebUI >= 0.9.0: DB methods are async, so we await them.
-    - OpenWebUI <  0.9.0: DB methods are sync, so we call them directly.
-    """
-    if _owui_version_ge("0.9.0"):
-        return await method(*args, **kwargs)
-    else:
-        return method(*args, **kwargs)
-
-
-def _call_db_sync(method, *args, **kwargs):
-    """
-    Call an OpenWebUI DB model method with version-aware async handling (for sync contexts).
-    - OpenWebUI <  0.9.0: DB methods are sync, call directly.
-    - OpenWebUI >= 0.9.0: DB methods are async, run in a separate thread with its own event loop.
-    """
-    if not _owui_version_ge("0.9.0"):
-        return method(*args, **kwargs)
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, method(*args, **kwargs)).result()
-
-
-class ChatSummary(owui_Base):
-    """Chat Summary Storage Table"""
-
-    __tablename__ = "chat_summary"
-    __table_args__ = (
-        {"extend_existing": True, "schema": owui_schema}
-        if owui_schema
-        else {"extend_existing": True}
-    )
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id = Column(String(255), unique=True, nullable=False, index=True)
-    summary = Column(Text, nullable=False)
-    compressed_message_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(
-        DateTime,
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
-    )
+# ── i18n.py · Language resolution + translation lookup ────────────────
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
 
 
 TRANSLATIONS = {
@@ -224,6 +93,50 @@ TRANSLATIONS = {
         "content_collapsed": "\n... [内容已折叠] ...\n",
     },
 }
+
+class I18nMixin:
+
+    """Language resolution + translation lookup."""
+
+    def _resolve_language(self, lang: str) -> str:
+        """Resolve the best matching language code from the TRANSLATIONS dict."""
+        target_lang = lang
+
+        # 1. Direct match
+        if target_lang in TRANSLATIONS:
+            return target_lang
+
+        # 2. Variant fallback (explicit mapping)
+        if target_lang in self.fallback_map:
+            target_lang = self.fallback_map[target_lang]
+            if target_lang in TRANSLATIONS:
+                return target_lang
+
+        # 3. Base language fallback (e.g. fr-BE -> fr-FR)
+        if "-" in lang:
+            base_lang = lang.split("-")[0]
+            for supported_lang in TRANSLATIONS:
+                if supported_lang.startswith(base_lang + "-"):
+                    return supported_lang
+
+        # 4. Final Fallback to en-US
+        return "en-US"
+
+    def _get_translation(self, lang: str, key: str, **kwargs) -> str:
+        """Get translated string for the given language and key."""
+        target_lang = self._resolve_language(lang)
+        lang_dict = TRANSLATIONS.get(target_lang, TRANSLATIONS["en-US"])
+        text = lang_dict.get(key, TRANSLATIONS["en-US"].get(key, key))
+        if kwargs:
+            try:
+                text = text.format(**kwargs)
+            except Exception as e:
+                logger.warning(f"Translation formatting failed for {key}: {e}")
+        return text
+
+# ── tokens.py · Token counting (tiktoken + fast estimator) ────────────
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
 
 
 # Global cache for tiktoken encoding
@@ -367,298 +280,440 @@ def _get_cached_tokens(text: str) -> int:
 
     return _estimate_text_tokens(text)
 
+class TokenMixin:
 
-class Filter:
-    def __init__(self):
-        self.valves = self.Valves()
-        self._owui_db = owui_db
-        self._db_engine = owui_engine
-        self._fallback_session_factory = (
-            sessionmaker(bind=self._db_engine) if self._db_engine else None
-        )
-        self._model_thresholds_cache: Optional[Dict[str, Any]] = None
+    """Token counting (tiktoken + fast estimator)."""
 
-        # Fallback mapping for variants not in TRANSLATIONS keys
-        self.fallback_map = {
-            "en-CA": "en-US",
-            "en-GB": "en-US",
-            "en-AU": "en-US",
-        }
+    def _count_tokens(self, text: str) -> int:
+        """Counts the number of tokens in the text."""
+        return _get_cached_tokens(text)
 
-        # Concurrency control: Lock per chat session
-        self._chat_locks = {}
-        self._pending_inlet_messages: Dict[str, List[Dict[str, Any]]] = {}
-        self._init_database()
+    def _extract_text_content(self, content: Any) -> str:
+        """Extract human-readable text from string, multimodal list, or dict payloads."""
+        if isinstance(content, str):
+            return content
 
-    def _resolve_language(self, lang: str) -> str:
-        """Resolve the best matching language code from the TRANSLATIONS dict."""
-        target_lang = lang
+        if isinstance(content, dict):
+            text_value = content.get("text")
+            if isinstance(text_value, str):
+                return text_value
+            nested_content = content.get("content")
+            if isinstance(nested_content, str):
+                return nested_content
+            return ""
 
-        # 1. Direct match
-        if target_lang in TRANSLATIONS:
-            return target_lang
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    text_value = part.get("text")
+                    if isinstance(text_value, str) and text_value:
+                        text_parts.append(text_value)
+                        continue
 
-        # 2. Variant fallback (explicit mapping)
-        if target_lang in self.fallback_map:
-            target_lang = self.fallback_map[target_lang]
-            if target_lang in TRANSLATIONS:
-                return target_lang
+                    nested_content = part.get("content")
+                    if isinstance(nested_content, str) and nested_content:
+                        text_parts.append(nested_content)
 
-        # 3. Base language fallback (e.g. fr-BE -> fr-FR)
-        if "-" in lang:
-            base_lang = lang.split("-")[0]
-            for supported_lang in TRANSLATIONS:
-                if supported_lang.startswith(base_lang + "-"):
-                    return supported_lang
+            return " ".join(text_parts)
 
-        # 4. Final Fallback to en-US
-        return "en-US"
+        return str(content) if content is not None else ""
 
-    def _get_translation(self, lang: str, key: str, **kwargs) -> str:
-        """Get translated string for the given language and key."""
-        target_lang = self._resolve_language(lang)
-        lang_dict = TRANSLATIONS.get(target_lang, TRANSLATIONS["en-US"])
-        text = lang_dict.get(key, TRANSLATIONS["en-US"].get(key, key))
-        if kwargs:
-            try:
-                text = text.format(**kwargs)
-            except Exception as e:
-                logger.warning(f"Translation formatting failed for {key}: {e}")
-        return text
+    def _message_content_char_length(self, content: Any) -> int:
+        return len(self._extract_text_content(content))
 
-    def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        """Get or create an asyncio lock for a specific chat ID."""
-        if chat_id not in self._chat_locks:
-            self._chat_locks[chat_id] = asyncio.Lock()
-        return self._chat_locks[chat_id]
+    def _estimate_content_tokens(self, content: Any) -> int:
+        return _estimate_text_tokens(self._extract_text_content(content))
 
-    def _capture_pending_inlet_messages(
-        self, chat_id: str, messages: List[Dict[str, Any]]
-    ) -> None:
-        """Persist transient inlet-only messages so outlet can rebuild sent context."""
-        pending_messages = []
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
+    def _calculate_messages_tokens(self, messages: List[Dict]) -> int:
+        """Calculates the total tokens for a list of messages."""
+        start_time = time.time()
+        total_tokens = 0
+        for msg in messages:
+            content = self._extract_text_content(msg.get("content", ""))
+            total_tokens += self._count_tokens(content)
 
-            metadata = message.get("metadata", {})
-            if not isinstance(metadata, dict):
-                continue
-
-            if metadata.get("is_external_references") or metadata.get(
-                "external_references"
-            ):
-                pending_messages.append(deepcopy(message))
-
-        if pending_messages:
-            self._pending_inlet_messages[chat_id] = pending_messages
-        else:
-            self._pending_inlet_messages.pop(chat_id, None)
-
-    def _restore_pending_inlet_messages(
-        self, chat_id: str, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Reapply transient inlet-only messages after outlet rebuilds persisted history."""
-        pending_messages = self._pending_inlet_messages.pop(chat_id, None)
-        if not pending_messages:
-            return messages
-
-        restored_messages = list(messages)
-        base_keep_first = self._get_effective_keep_first(messages)
-
-        for pending_message in pending_messages:
-            if not isinstance(pending_message, dict):
-                continue
-
-            pending_content = pending_message.get("content", "")
-            if any(
-                isinstance(existing, dict)
-                and existing.get("role") == pending_message.get("role")
-                and existing.get("content", "") == pending_content
-                for existing in restored_messages
-            ):
-                continue
-
-            metadata = pending_message.get("metadata", {})
-            covered_until = (
-                metadata.get("covered_until", base_keep_first)
-                if isinstance(metadata, dict)
-                else base_keep_first
-            )
-            try:
-                insert_index = int(covered_until)
-            except Exception:
-                insert_index = base_keep_first
-
-            insert_index = max(0, min(insert_index, len(restored_messages)))
-            restored_messages.insert(insert_index, deepcopy(pending_message))
-
-        return restored_messages
-
-    def _is_summary_message(self, message: Dict[str, Any]) -> bool:
-        """Return True when the message is this filter's injected summary marker."""
-        metadata = message.get("metadata", {})
-        if not isinstance(metadata, dict):
-            return False
-        return bool(
-            metadata.get("is_summary")
-            and metadata.get("source") == SUMMARY_METADATA_SOURCE
-        )
-
-    def _build_summary_message(
-        self, summary_text: str, lang: str, covered_until: int
-    ) -> Dict[str, Any]:
-        """Create a summary marker message with original-history progress metadata."""
-        summary_content = (
-            self._get_translation(lang, "summary_prompt_prefix")
-            + f"{summary_text}"
-            + self._get_translation(lang, "summary_prompt_suffix")
-        )
-        return {
-            "role": "assistant",
-            "content": summary_content,
-            "metadata": {
-                "is_summary": True,
-                "source": SUMMARY_METADATA_SOURCE,
-                "covered_until": max(0, int(covered_until)),
-            },
-        }
-
-    def _is_external_reference_message(self, message: Dict[str, Any]) -> bool:
-        metadata = message.get("metadata", {})
-        if not isinstance(metadata, dict):
-            return False
-        return bool(
-            metadata.get("is_external_references")
-            or metadata.get("source") == "external_references"
-        )
-
-    def _get_summary_view_state(self, messages: List[Dict]) -> Dict[str, Optional[int]]:
-        """Inspect the current message view and recover summary marker metadata."""
-        for index, message in enumerate(messages):
-            if self._is_external_reference_message(message):
-                continue
-            if not self._is_summary_message(message):
-                continue
-
-            metadata = message.get("metadata", {})
-            covered_until = metadata.get("covered_until", 0)
-            if not isinstance(covered_until, int) or covered_until < 0:
-                covered_until = 0
-
-            return {
-                "summary_index": index,
-                "base_progress": covered_until,
-            }
-
-        return {"summary_index": None, "base_progress": 0}
-
-    def _get_original_history_count(self, messages: List[Dict]) -> int:
-        """Map the current visible message list back to original-history size."""
-        summary_state = self._get_summary_view_state(messages)
-        summary_index = summary_state["summary_index"]
-        base_progress = summary_state["base_progress"] or 0
-
-        if summary_index is None:
-            return len(messages)
-
-        return base_progress + max(0, len(messages) - summary_index - 1)
-
-    def _calculate_target_compressed_count(self, messages: List[Dict]) -> int:
-        """Calculate the next summary boundary in original-history coordinates."""
-        summary_state = self._get_summary_view_state(messages)
-        summary_index = summary_state["summary_index"]
-        base_progress = summary_state["base_progress"] or 0
-
-        original_count = self._get_original_history_count(messages)
-        raw_target = max(base_progress, original_count - self.valves.keep_last)
-
-        if summary_index is None:
-            protected_prefix = self._get_effective_keep_first(messages)
-            return self._align_tail_start_to_atomic_boundary(
-                messages, raw_target, protected_prefix
+        duration = (time.time() - start_time) * 1000
+        if self.valves.debug_mode:
+            logger.info(
+                f"[Token Calc] Calculated {total_tokens} tokens for {len(messages)} messages in {duration:.2f}ms"
             )
 
-        if raw_target <= base_progress:
-            return base_progress
+        return total_tokens
 
-        tail_messages = messages[summary_index + 1 :]
-        local_target = raw_target - base_progress
-        aligned_local_target = self._align_tail_start_to_atomic_boundary(
-            tail_messages, local_target, 0
-        )
-        return base_progress + aligned_local_target
+    def _estimate_messages_tokens(self, messages: List[Dict]) -> int:
+        """Fast estimation of tokens using mixed-script heuristics."""
+        total_tokens = 0
+        for msg in messages:
+            total_tokens += self._estimate_content_tokens(msg.get("content", ""))
 
-    def _reconstruct_active_history_branch(
-        self, history_messages: Any, current_id: Optional[str]
-    ) -> List[Dict[str, Any]]:
-        """Rebuild the active chat branch from OpenWebUI `history.messages` data."""
-        if not isinstance(history_messages, dict) or not history_messages:
-            return []
+        return total_tokens
 
-        if isinstance(current_id, str) and current_id in history_messages:
-            ordered_messages: List[Dict[str, Any]] = []
-            visited = set()
-            cursor = current_id
+# ── db.py · DB engine/schema discovery, ChatSummary model, sessions, summary persistence 
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
 
-            while isinstance(cursor, str) and cursor and cursor not in visited:
-                visited.add(cursor)
-                node = history_messages.get(cursor)
-                if not isinstance(node, dict):
-                    break
 
-                ordered_messages.append(deepcopy(node))
-                cursor = node.get("parentId") or node.get("parent_id")
+def _discover_owui_engine(db_module: Any) -> Optional[Engine]:
+    """Discover the Open WebUI SQLAlchemy engine via provided db module helpers."""
+    if db_module is None:
+        return None
 
-            if ordered_messages:
-                ordered_messages.reverse()
-                return ordered_messages
-
-        sortable_messages = []
-        for index, node in enumerate(history_messages.values()):
-            if not isinstance(node, dict):
-                continue
-
-            timestamp = node.get("timestamp")
-            if not isinstance(timestamp, (int, float)):
-                timestamp = node.get("created_at")
-            if not isinstance(timestamp, (int, float)):
-                timestamp = index
-
-            sortable_messages.append((float(timestamp), index, deepcopy(node)))
-
-        sortable_messages.sort(key=lambda item: (item[0], item[1]))
-        return [message for _, _, message in sortable_messages]
-
-    async def _load_full_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
-        """Load the full persisted chat history for summary decisions when available."""
-        if not chat_id or Chats is None:
-            return []
-
+    db_context = getattr(db_module, "get_db_context", None) or getattr(
+        db_module, "get_db", None
+    )
+    if callable(db_context):
         try:
-            chat_record = await _call_db(Chats.get_chat_by_id, chat_id)
+            with db_context() as session:
+                try:
+                    return session.get_bind()
+                except AttributeError:
+                    return getattr(session, "bind", None) or getattr(
+                        session, "engine", None
+                    )
         except Exception as exc:
-            logger.warning(f"[Chat Load] Failed to fetch chat {chat_id}: {exc}")
-            return []
+            logger.error(f"[DB Discover] get_db_context failed: {exc}")
 
-        chat_payload = getattr(chat_record, "chat", None)
-        if not isinstance(chat_payload, dict):
-            return []
+    for attr in ("engine", "ENGINE", "bind", "BIND"):
+        candidate = getattr(db_module, attr, None)
+        if candidate is not None:
+            return candidate
 
-        direct_messages = chat_payload.get("messages")
-        if isinstance(direct_messages, list) and direct_messages:
-            return deepcopy(direct_messages)
+    return None
 
-        history = chat_payload.get("history")
-        if not isinstance(history, dict):
-            return []
 
-        history_messages = history.get("messages")
-        if not isinstance(history_messages, dict) or not history_messages:
-            return []
+def _discover_owui_schema(db_module: Any) -> Optional[str]:
+    """Discover the Open WebUI database schema name if configured."""
+    if db_module is None:
+        return None
 
-        current_id = history.get("currentId") or history.get("current_id")
-        return self._reconstruct_active_history_branch(history_messages, current_id)
+    try:
+        base = getattr(db_module, "Base", None)
+        metadata = getattr(base, "metadata", None) if base is not None else None
+        candidate = getattr(metadata, "schema", None) if metadata is not None else None
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    except Exception as exc:
+        logger.error(f"[DB Discover] Base metadata schema lookup failed: {exc}")
+
+    try:
+        metadata_obj = getattr(db_module, "metadata_obj", None)
+        candidate = (
+            getattr(metadata_obj, "schema", None) if metadata_obj is not None else None
+        )
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    except Exception as exc:
+        logger.error(f"[DB Discover] metadata_obj schema lookup failed: {exc}")
+
+    try:
+        from open_webui import env as owui_env
+
+        candidate = getattr(owui_env, "DATABASE_SCHEMA", None)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    except Exception as exc:
+        logger.error(f"[DB Discover] env schema lookup failed: {exc}")
+
+    return None
+
+
+owui_engine = _discover_owui_engine(owui_db)
+owui_schema = _discover_owui_schema(owui_db)
+owui_Base = getattr(owui_db, "Base", None) if owui_db is not None else None
+if owui_Base is None:
+    owui_Base = declarative_base()
+
+# ── OpenWebUI version detection for async DB compatibility ──────────
+try:
+    from open_webui.env import VERSION as _owui_version
+except ImportError:
+    _owui_version = "0.0.0"
+
+
+def _owui_version_ge(threshold: str) -> bool:
+    """Return True if open_webui_version >= threshold (e.g. '0.9.0')."""
+    try:
+        v = [int(x) for x in _owui_version.split(".")[:3]]
+        t = [int(x) for x in threshold.split(".")[:3]]
+        return v >= t
+    except (ValueError, TypeError):
+        return False
+
+
+async def _call_db(method, *args, **kwargs):
+    """
+    Call an OpenWebUI DB model method with version-aware async handling.
+    - OpenWebUI >= 0.9.0: DB methods are async, so we await them.
+    - OpenWebUI <  0.9.0: DB methods are sync, so we call them directly.
+    """
+    if _owui_version_ge("0.9.0"):
+        return await method(*args, **kwargs)
+    else:
+        return method(*args, **kwargs)
+
+
+def _call_db_sync(method, *args, **kwargs):
+    """
+    Call an OpenWebUI DB model method with version-aware async handling (for sync contexts).
+    - OpenWebUI <  0.9.0: DB methods are sync, call directly.
+    - OpenWebUI >= 0.9.0: DB methods are async, run in a separate thread with its own event loop.
+    """
+    if not _owui_version_ge("0.9.0"):
+        return method(*args, **kwargs)
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, method(*args, **kwargs)).result()
+
+
+class ChatSummary(owui_Base):
+    """Chat Summary Storage Table"""
+
+    __tablename__ = "chat_summary"
+    __table_args__ = (
+        {"extend_existing": True, "schema": owui_schema}
+        if owui_schema
+        else {"extend_existing": True}
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(String(255), unique=True, nullable=False, index=True)
+    summary = Column(Text, nullable=False)
+    compressed_message_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+class DBMixin:
+
+    """DB engine/schema discovery, ChatSummary model, sessions, summary persistence."""
+
+    async def _async_db_session(self):
+        """
+        Yield an async-capable database session.
+
+        - OpenWebUI >= 0.9.0: uses ``get_async_db_context`` (AsyncSession).
+        - OpenWebUI <  0.9.0: wraps the sync ``_db_session`` via ``asyncio.to_thread``.
+        """
+        db_module = self._owui_db
+        async_ctx = getattr(db_module, "get_async_db_context", None)
+        if callable(async_ctx):
+            async with async_ctx() as session:
+                yield session
+                return
+        async_db = getattr(db_module, "get_async_db", None)
+        if callable(async_db):
+            async with async_db() as session:
+                yield session
+                return
+
+        # Fallback: wrap sync session in a thread for < 0.9.0
+        # (sync pool is safe to use in < 0.9.0 since there's no competing async pool)
+        with self._sync_db_session() as session:
+            yield session
+
+    def _sync_db_session(self):
+        """Yield a SYNC database session — reserved for startup/initialization only."""
+        db_module = self._owui_db
+        db_context = None
+        if db_module is not None:
+            db_context = getattr(db_module, "get_db_context", None) or getattr(
+                db_module, "get_db", None
+            )
+
+        if callable(db_context):
+            with db_context() as session:
+                yield session
+                return
+
+        factory = None
+        if db_module is not None:
+            factory = getattr(db_module, "SessionLocal", None) or getattr(
+                db_module, "ScopedSession", None
+            )
+        if callable(factory):
+            session = factory()
+            try:
+                yield session
+            finally:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
+            return
+
+        if self._fallback_session_factory is None:
+            raise RuntimeError(
+                "Open WebUI database session is unavailable. Ensure Open WebUI's database layer is initialized."
+            )
+
+        session = self._fallback_session_factory()
+        try:
+            yield session
+        finally:
+            try:
+                session.close()
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                logger.warning(f"[Database] ⚠️ Failed to close fallback session: {exc}")
+
+    def _init_database(self):
+        """Initializes the database table using Open WebUI's shared connection."""
+        try:
+            if self._db_engine is None:
+                raise RuntimeError(
+                    "Open WebUI database engine is unavailable. Ensure Open WebUI is configured with a valid DATABASE_URL."
+                )
+
+            # Check if table exists using SQLAlchemy inspect
+            inspector = inspect(self._db_engine)
+            # Support schema if configured
+            has_table = (
+                inspector.has_table("chat_summary", schema=owui_schema)
+                if owui_schema
+                else inspector.has_table("chat_summary")
+            )
+
+            if not has_table:
+                # Create the chat_summary table if it doesn't exist
+                ChatSummary.__table__.create(bind=self._db_engine, checkfirst=True)
+                logger.info(
+                    "[Database] ✅ Successfully created chat_summary table using Open WebUI's shared database connection."
+                )
+            else:
+                logger.info(
+                    "[Database] ✅ Using Open WebUI's shared database connection. chat_summary table already exists."
+                )
+
+        except Exception as e:
+            logger.error(f"[Database] ❌ Initialization failed: {str(e)}")
+
+    async def _save_summary(self, chat_id: str, summary: str, compressed_count: int):
+        """Saves the summary to the database (async, compatible with 0.9.0 async sessions)."""
+        try:
+            async with self._async_db_session() as session:
+                # Detect session type: async sessions expose execute as a coroutinefunction
+                if iscoroutinefunction(getattr(session, "execute", None)):
+                    # SQLAlchemy 2.0 async style (AsyncSession)
+                    from sqlalchemy import select
+
+                    result = await session.execute(
+                        select(ChatSummary).filter_by(chat_id=chat_id)
+                    )
+                    existing = result.scalars().first()
+
+                    if existing:
+                        # Optimistic lock: skip if progress hasn't advanced
+                        if compressed_count <= existing.compressed_message_count:
+                            if self.valves.debug_mode:
+                                logger.info(
+                                    f"[Storage] Skipping update: New progress ({compressed_count}) "
+                                    f"<= existing ({existing.compressed_message_count})"
+                                )
+                            return
+                        existing.summary = summary
+                        existing.compressed_message_count = compressed_count
+                        existing.updated_at = datetime.now(timezone.utc)
+                    else:
+                        new_summary = ChatSummary(
+                            chat_id=chat_id,
+                            summary=summary,
+                            compressed_message_count=compressed_count,
+                        )
+                        session.add(new_summary)
+
+                    await session.commit()
+
+                    if self.valves.debug_mode:
+                        action = "Updated" if existing else "Created"
+                        logger.info(
+                            f"[Storage] Summary has been {action.lower()} in the database (Chat ID: {chat_id})"
+                        )
+                else:
+                    # < 0.9.0: sync session (Session)
+                    existing = (
+                        session.query(ChatSummary).filter_by(chat_id=chat_id).first()
+                    )
+
+                    if existing:
+                        if compressed_count <= existing.compressed_message_count:
+                            if self.valves.debug_mode:
+                                logger.info(
+                                    f"[Storage] Skipping update: New progress ({compressed_count}) "
+                                    f"<= existing ({existing.compressed_message_count})"
+                                )
+                            return
+                        existing.summary = summary
+                        existing.compressed_message_count = compressed_count
+                        existing.updated_at = datetime.now(timezone.utc)
+                    else:
+                        new_summary = ChatSummary(
+                            chat_id=chat_id,
+                            summary=summary,
+                            compressed_message_count=compressed_count,
+                        )
+                        session.add(new_summary)
+
+                    session.commit()
+
+                    if self.valves.debug_mode:
+                        action = "Updated" if existing else "Created"
+                        logger.info(
+                            f"[Storage] Summary has been {action.lower()} in the database (Chat ID: {chat_id})"
+                        )
+
+        except Exception as e:
+            logger.error(f"[Storage] ❌ Database save failed: {str(e)}")
+
+    async def _load_summary_record(self, chat_id: str) -> Optional[ChatSummary]:
+        """Loads the summary record object from the database (async, compatible with 0.9.0)."""
+        try:
+            async with self._async_db_session() as session:
+                # Detect session type: async sessions expose execute as a coroutinefunction
+                if iscoroutinefunction(getattr(session, "execute", None)):
+                    # SQLAlchemy 2.0 async style (AsyncSession)
+                    from sqlalchemy import select
+
+                    result = await session.execute(
+                        select(ChatSummary).filter_by(chat_id=chat_id)
+                    )
+                    record = result.scalars().first()
+                    if record:
+                        return record
+                else:
+                    # < 0.9.0: sync session (Session)
+                    record = (
+                        session.query(ChatSummary).filter_by(chat_id=chat_id).first()
+                    )
+                    if record:
+                        session.expunge(record)
+                        return record
+        except Exception as e:
+            logger.error(f"[Load] ❌ Database read failed: {str(e)}")
+        return None
+
+    async def _load_summary(self, chat_id: str, body: dict) -> Optional[str]:
+        """Loads the summary text from the database (async, compatible with 0.9.0)."""
+        record = await self._load_summary_record(chat_id)
+        if record:
+            if self.valves.debug_mode:
+                logger.info(f"[Load] Loaded summary from database (Chat ID: {chat_id})")
+                logger.info(
+                    f"[Load] Last updated: {record.updated_at}, Compressed message count: {record.compressed_message_count}"
+                )
+            return record.summary
+        return None
+
+# ── toolcalls.py · Native tool-call normalization, trimming, atomic grouping 
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
+
+
+class ToolCallMixin:
+
+    """Native tool-call normalization, trimming, atomic grouping."""
 
     def _shorten_tool_call_id(self, tool_call_id: str, max_length: int = 40) -> str:
         """Keep tool call IDs within provider limits while staying deterministic."""
@@ -928,27 +983,6 @@ class Filter:
 
         return groups
 
-    def _get_effective_keep_first(self, messages: List[Dict]) -> int:
-        """
-        Calculate the index to protect the first N NON-SYSTEM messages.
-        All system messages encountered before reaching the Nth non-system message are also kept.
-        """
-        if not messages or self.valves.keep_first <= 0:
-            return 0
-
-        non_system_count = 0
-
-        for i, msg in enumerate(messages):
-            if msg.get("role") != "system":
-                non_system_count += 1
-
-            if non_system_count >= self.valves.keep_first:
-                return i + 1
-
-        # All messages scanned but never reached keep_first non-system messages;
-        # protect everything we have.
-        return len(messages)
-
     def _align_tail_start_to_atomic_boundary(
         self, messages: List[Dict], raw_start_index: int, protected_prefix: int
     ) -> int:
@@ -978,892 +1012,6 @@ class Filter:
                 return protected_prefix + group_start
 
         return aligned_start
-
-    async def _get_user_context(
-        self,
-        __user__: Optional[Dict[str, Any]],
-        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
-    ) -> Dict[str, str]:
-        """Extract basic user context with safe fallbacks."""
-        if isinstance(__user__, (list, tuple)):
-            user_data = __user__[0] if __user__ else {}
-        elif isinstance(__user__, dict):
-            user_data = __user__
-        else:
-            user_data = {}
-
-        user_id = user_data.get("id", "unknown_user")
-        user_name = user_data.get("name", "User")
-        user_language = user_data.get("language", "en-US")
-
-        if __event_call__:
-            try:
-                js_code = """
-                    try {
-                        return (
-                            document.documentElement.lang ||
-                            localStorage.getItem('locale') ||
-                            localStorage.getItem('language') ||
-                            navigator.language ||
-                            'en-US'
-                        );
-                    } catch (e) {
-                        return 'en-US';
-                    }
-                """
-                frontend_lang = await asyncio.wait_for(
-                    __event_call__({"type": "execute", "data": {"code": js_code}}),
-                    timeout=2.0,
-                )
-                if frontend_lang and isinstance(frontend_lang, str):
-                    user_language = frontend_lang
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Failed to retrieve frontend language: Timeout (using fallback)"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to retrieve frontend language: {type(e).__name__}: {e}"
-                )
-
-        return {
-            "user_id": user_id,
-            "user_name": user_name,
-            "user_language": user_language,
-        }
-
-    def _parse_model_thresholds(self) -> Dict[str, Any]:
-        """Parse model_thresholds string into a dictionary.
-
-        Format: model_id:compression_threshold:max_context, model_id2:threshold2:max2
-        Example: gpt-4:8000:32000, claude-3:100000:200000
-
-        Returns cached result if already parsed.
-        """
-        if self._model_thresholds_cache is not None:
-            return self._model_thresholds_cache
-
-        self._model_thresholds_cache = {}
-        raw_config = self.valves.model_thresholds
-        if not raw_config:
-            return self._model_thresholds_cache
-
-        for entry in raw_config.split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-
-            parts = entry.split(":")
-            if len(parts) != 3:
-                continue
-
-            try:
-                model_id = parts[0].strip()
-                compression_threshold = int(parts[1].strip())
-                max_context = int(parts[2].strip())
-
-                self._model_thresholds_cache[model_id] = {
-                    "compression_threshold_tokens": compression_threshold,
-                    "max_context_tokens": max_context,
-                }
-            except ValueError:
-                continue
-
-        return self._model_thresholds_cache
-
-    @contextlib.asynccontextmanager
-    async def _async_db_session(self):
-        """
-        Yield an async-capable database session.
-
-        - OpenWebUI >= 0.9.0: uses ``get_async_db_context`` (AsyncSession).
-        - OpenWebUI <  0.9.0: wraps the sync ``_db_session`` via ``asyncio.to_thread``.
-        """
-        db_module = self._owui_db
-        async_ctx = getattr(db_module, "get_async_db_context", None)
-        if callable(async_ctx):
-            async with async_ctx() as session:
-                yield session
-                return
-        async_db = getattr(db_module, "get_async_db", None)
-        if callable(async_db):
-            async with async_db() as session:
-                yield session
-                return
-
-        # Fallback: wrap sync session in a thread for < 0.9.0
-        # (sync pool is safe to use in < 0.9.0 since there's no competing async pool)
-        with self._sync_db_session() as session:
-            yield session
-
-    @contextlib.contextmanager
-    def _sync_db_session(self):
-        """Yield a SYNC database session — reserved for startup/initialization only."""
-        db_module = self._owui_db
-        db_context = None
-        if db_module is not None:
-            db_context = getattr(db_module, "get_db_context", None) or getattr(
-                db_module, "get_db", None
-            )
-
-        if callable(db_context):
-            with db_context() as session:
-                yield session
-                return
-
-        factory = None
-        if db_module is not None:
-            factory = getattr(db_module, "SessionLocal", None) or getattr(
-                db_module, "ScopedSession", None
-            )
-        if callable(factory):
-            session = factory()
-            try:
-                yield session
-            finally:
-                close = getattr(session, "close", None)
-                if callable(close):
-                    close()
-            return
-
-        if self._fallback_session_factory is None:
-            raise RuntimeError(
-                "Open WebUI database session is unavailable. Ensure Open WebUI's database layer is initialized."
-            )
-
-        session = self._fallback_session_factory()
-        try:
-            yield session
-        finally:
-            try:
-                session.close()
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning(f"[Database] ⚠️ Failed to close fallback session: {exc}")
-
-    def _init_database(self):
-        """Initializes the database table using Open WebUI's shared connection."""
-        try:
-            if self._db_engine is None:
-                raise RuntimeError(
-                    "Open WebUI database engine is unavailable. Ensure Open WebUI is configured with a valid DATABASE_URL."
-                )
-
-            # Check if table exists using SQLAlchemy inspect
-            inspector = inspect(self._db_engine)
-            # Support schema if configured
-            has_table = (
-                inspector.has_table("chat_summary", schema=owui_schema)
-                if owui_schema
-                else inspector.has_table("chat_summary")
-            )
-
-            if not has_table:
-                # Create the chat_summary table if it doesn't exist
-                ChatSummary.__table__.create(bind=self._db_engine, checkfirst=True)
-                logger.info(
-                    "[Database] ✅ Successfully created chat_summary table using Open WebUI's shared database connection."
-                )
-            else:
-                logger.info(
-                    "[Database] ✅ Using Open WebUI's shared database connection. chat_summary table already exists."
-                )
-
-        except Exception as e:
-            logger.error(f"[Database] ❌ Initialization failed: {str(e)}")
-
-    class Valves(BaseModel):
-        priority: int = Field(
-            default=10, description="Priority level for the filter operations."
-        )
-        # Token related parameters
-        compression_threshold_tokens: int = Field(
-            default=64000,
-            ge=0,
-            description="When total context Token count exceeds this value, trigger compression (Global Default)",
-        )
-        max_context_tokens: int = Field(
-            default=128000,
-            ge=0,
-            description="Hard limit for context. Exceeding this value will force removal of earliest messages (Global Default)",
-        )
-        model_thresholds: str = Field(
-            default="",
-            description="Per-model threshold overrides. Format: model_id:compression_threshold:max_context (comma-separated). Example: gpt-4:8000:32000, claude-3:100000:200000",
-        )
-
-        keep_first: int = Field(
-            default=0,
-            ge=0,
-            description="Keep the first N non-system messages plus all interleaved system messages. Set to 0 to disable.",
-        )
-        keep_last: int = Field(
-            default=6, ge=0, description="Always keep the last N full messages."
-        )
-        summary_model: Optional[str] = Field(
-            default=None,
-            description="The model ID used to generate the summary. If empty, uses the current conversation's model. Used to match configurations in model_thresholds.",
-        )
-        summary_model_max_context: int = Field(
-            default=0,
-            ge=0,
-            description="Max context tokens for the summary model. If 0, falls back to model_thresholds or global max_context_tokens. Example: gemini-flash=1000000, gpt-4o-mini=128000.",
-        )
-        max_summary_tokens: int = Field(
-            default=16384,
-            ge=1,
-            description="The maximum number of tokens for the summary.",
-        )
-        summary_temperature: float = Field(
-            default=0.1,
-            ge=0.0,
-            le=2.0,
-            description="The temperature for summary generation.",
-        )
-        debug_mode: bool = Field(
-            default=False, description="Enable detailed logging for debugging."
-        )
-        show_debug_log: bool = Field(
-            default=False, description="Show debug logs in the frontend console"
-        )
-        show_token_usage_status: bool = Field(
-            default=True, description="Show token usage status notification"
-        )
-        token_usage_status_threshold: int = Field(
-            default=80,
-            ge=0,
-            le=100,
-            description="Only show token usage status when usage exceeds this percentage (0-100). Set to 0 to always show.",
-        )
-        enable_tool_output_trimming: bool = Field(
-            default=True,
-            description="Enable trimming of large tool outputs (only works with native function calling).",
-        )
-        tool_trim_threshold_chars: int = Field(
-            default=600,
-            ge=1,
-            description="Trim native tool outputs when their total content length reaches this many characters.",
-        )
-
-    async def _handle_external_chat_references(
-        self,
-        body: dict,
-        user_data: Optional[dict] = None,
-        __event_call__: Callable = None,
-        __request__: Request = None,
-    ) -> dict:
-        metadata = body.get("metadata", {})
-        files = metadata.get("files", [])
-
-        if not files:
-            return body
-
-        chat_files = [f for f in files if f.get("type") == "chat"]
-        if not chat_files:
-            return body
-
-        if __event_call__:
-            await self._log(
-                f"[Inlet] 📎 Found {len(chat_files)} external chat reference(s)",
-                event_call=__event_call__,
-            )
-
-        model_id = self._clean_model_id(body.get("model"))
-        thresholds = self._get_model_thresholds(model_id) or {}
-        max_context_tokens = thresholds.get(
-            "max_context_tokens", self.valves.max_context_tokens
-        )
-        max_summary_tokens = self.valves.max_summary_tokens or 4096
-        summary_model = (
-            self._clean_model_id(self.valves.summary_model)
-            or self._clean_model_id(body.get("model"))
-            or "gpt-4o-mini"
-        )
-        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
-
-        base_messages = body.get("messages", [])
-        base_message_tokens = self._estimate_messages_tokens(base_messages)
-        remaining_direct_budget = (
-            max(0, max_context_tokens - base_message_tokens)
-            if max_context_tokens and max_context_tokens > 0
-            else max_summary_tokens
-        )
-
-        referenced_summaries = []
-        for chat_file in chat_files:
-            ref_chat_id = chat_file.get("id")
-            if isinstance(ref_chat_id, str):
-                ref_chat_title = chat_file.get("name", f"Chat {ref_chat_id[:8]}...")
-            else:
-                ref_chat_title = chat_file.get("name", "Unknown Chat")
-
-            if not ref_chat_id:
-                continue
-
-            summary_record = await self._load_summary_record(ref_chat_id)
-
-            if summary_record and summary_record.summary:
-                remaining_direct_budget = max(
-                    0,
-                    remaining_direct_budget
-                    - _estimate_text_tokens(summary_record.summary),
-                )
-                referenced_summaries.append(
-                    {
-                        "chat_id": ref_chat_id,
-                        "title": ref_chat_title,
-                        "summary": summary_record.summary,
-                        "type": "existing",
-                    }
-                )
-                if __event_call__:
-                    await self._log(
-                        f"[Inlet] ✅ Found existing summary for referenced chat '{ref_chat_title}' ({len(summary_record.summary)} chars)",
-                        event_call=__event_call__,
-                    )
-            else:
-                chat_messages = await self._load_full_chat_messages(ref_chat_id)
-                if not chat_messages:
-                    if __event_call__:
-                        await self._log(
-                            f"[Inlet] ⚠️ No messages found for '{ref_chat_title}', skipping",
-                            event_call=__event_call__,
-                        )
-                    continue
-
-                conversation_text = self._format_messages_for_summary(chat_messages)
-                estimated_tokens = _estimate_text_tokens(conversation_text)
-                inject_full_chat = estimated_tokens <= max(0, remaining_direct_budget)
-
-                if inject_full_chat:
-                    referenced_summaries.append(
-                        {
-                            "chat_id": ref_chat_id,
-                            "title": ref_chat_title,
-                            "summary": conversation_text,
-                            "type": "full",
-                        }
-                    )
-                    remaining_direct_budget = max(
-                        0, remaining_direct_budget - estimated_tokens
-                    )
-                    if __event_call__:
-                        await self._log(
-                            f"[Inlet] 📄 Chat '{ref_chat_title}' fits current model budget ({estimated_tokens} tokens), injecting full content",
-                            event_call=__event_call__,
-                        )
-                else:
-                    summary_input_text = conversation_text
-                    covered_message_count = len(chat_messages)
-                    covers_full_history = True
-
-                    if (
-                        summary_model_max_context > 0
-                        and estimated_tokens > summary_model_max_context
-                    ):
-                        summary_input_text = self._truncate_messages_for_summary(
-                            chat_messages, summary_model_max_context
-                        )
-                        truncated_tokens = _estimate_text_tokens(summary_input_text)
-                        covered_message_count = 0
-                        covers_full_history = False
-                        if __event_call__:
-                            await self._log(
-                                f"[Inlet] ✂️ Chat '{ref_chat_title}' exceeds summary input budget, truncating recent window from {estimated_tokens} to {truncated_tokens} tokens before summarization",
-                                event_call=__event_call__,
-                            )
-
-                    summary = ""
-                    generated_with_llm = False
-
-                    if isinstance(user_data, dict) and user_data.get("id"):
-                        if __event_call__:
-                            await self._log(
-                                f"[Inlet] 🤖 Generating referenced chat summary for '{ref_chat_title}' with model '{summary_model}'",
-                                event_call=__event_call__,
-                            )
-                        try:
-                            summary = await self._call_summary_llm(
-                                summary_input_text,
-                                {"model": summary_model},
-                                user_data,
-                                __event_call__,
-                                __request__,
-                                previous_summary=None,
-                            )
-                            generated_with_llm = bool(summary)
-                        except Exception as exc:
-                            logger.warning(
-                                "[Inlet] Referenced chat summary failed for '%s': %s",
-                                ref_chat_title,
-                                exc,
-                            )
-                            if __event_call__:
-                                await self._log(
-                                    f"[Inlet] ⚠️ Referenced chat summary failed for '{ref_chat_title}', falling back to direct contextual injection: {exc}",
-                                    log_type="warning",
-                                    event_call=__event_call__,
-                                )
-                    else:
-                        if __event_call__:
-                            await self._log(
-                                f"[Inlet] ⚠️ Missing user context for '{ref_chat_title}', falling back to direct contextual injection without LLM summary",
-                                event_call=__event_call__,
-                            )
-
-                    if not summary:
-                        summary = summary_input_text
-                        if __event_call__:
-                            await self._log(
-                                f"[Inlet] 📎 Falling back to direct contextual injection for '{ref_chat_title}'",
-                                event_call=__event_call__,
-                            )
-
-                    summary_estimate = _estimate_text_tokens(summary)
-                    if summary_estimate > max_summary_tokens:
-                        target_chars = max(
-                            1, int(len(summary) * max_summary_tokens / summary_estimate)
-                        )
-                        summary = summary[:target_chars]
-                        if __event_call__:
-                            await self._log(
-                                f"[Inlet] ✂️ Trimmed injected context for '{ref_chat_title}' to stay near {max_summary_tokens} tokens",
-                                event_call=__event_call__,
-                            )
-                        summary_estimate = _estimate_text_tokens(summary)
-
-                    remaining_direct_budget = max(
-                        0, remaining_direct_budget - summary_estimate
-                    )
-
-                    referenced_summaries.append(
-                        {
-                            "chat_id": ref_chat_id,
-                            "title": ref_chat_title,
-                            "summary": summary,
-                            "type": (
-                                "generated_summary"
-                                if generated_with_llm
-                                else "direct_fallback"
-                            ),
-                        }
-                    )
-
-                    if (
-                        generated_with_llm
-                        and covers_full_history
-                        and covered_message_count > 0
-                    ):
-                        await self._save_summary(
-                            ref_chat_id,
-                            summary,
-                            covered_message_count,
-                        )
-                        if __event_call__:
-                            await self._log(
-                                f"[Inlet] 💾 Saved summary cache for '{ref_chat_title}'",
-                                event_call=__event_call__,
-                            )
-
-        if not referenced_summaries:
-            return body
-
-        summary_parts = []
-        for ref in referenced_summaries:
-            summary_parts.append(
-                f'<referenced_chat id="{ref["chat_id"]}" name="{ref["title"]}">\n{ref["summary"]}\n</referenced_chat>'
-            )
-
-        if summary_parts:
-            ref_context = "\n\n".join(summary_parts)
-            ref_content = f"<referenced_chats>\n{ref_context}\n</referenced_chats>"
-
-            body["__external_references__"] = {
-                "content": ref_content,
-                "references": [
-                    {"chat_id": ref["chat_id"], "title": ref["title"]}
-                    for ref in referenced_summaries
-                ],
-            }
-
-            if __event_call__:
-                await self._log(
-                    f"[Inlet] 💉 Prepared {len(referenced_summaries)} referenced chat context block(s) for injection",
-                    event_call=__event_call__,
-                )
-
-        return body
-
-    async def _generate_referenced_summaries_background(
-        self,
-        referenced_chats: List[Dict[str, Any]],
-        user_data: Optional[dict] = None,
-        __request__: Request = None,
-        __event_call__: Callable = None,
-    ) -> List[Dict[str, Any]]:
-        """Generate cacheable summaries for referenced chats when enough context is available."""
-        if not referenced_chats:
-            return []
-
-        generated_summaries = []
-        summary_model = self._clean_model_id(self.valves.summary_model) or "gpt-4o-mini"
-        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
-
-        for referenced_chat in referenced_chats:
-            if not isinstance(referenced_chat, dict):
-                continue
-
-            ref_chat_id = referenced_chat.get("chat_id")
-            ref_chat_title = referenced_chat.get("title", "Unknown Chat")
-            if not ref_chat_id:
-                continue
-
-            summary_input_text = referenced_chat.get("conversation_text", "")
-            covers_full_history = bool(referenced_chat.get("covers_full_history", True))
-            covered_message_count = int(
-                referenced_chat.get("covered_message_count", 0) or 0
-            )
-
-            if (
-                not isinstance(summary_input_text, str)
-                or not summary_input_text.strip()
-            ):
-                chat_messages = await self._load_full_chat_messages(ref_chat_id)
-                if not chat_messages:
-                    continue
-                summary_input_text = self._format_messages_for_summary(chat_messages)
-                covers_full_history = True
-                covered_message_count = len(chat_messages)
-
-            estimated_tokens = _estimate_text_tokens(summary_input_text)
-            if (
-                summary_model_max_context > 0
-                and estimated_tokens > summary_model_max_context
-            ):
-                chat_messages = await self._load_full_chat_messages(ref_chat_id)
-                if chat_messages:
-                    summary_input_text = self._truncate_messages_for_summary(
-                        chat_messages, summary_model_max_context
-                    )
-                    covers_full_history = False
-                    covered_message_count = 0
-
-            if not isinstance(user_data, dict) or not user_data.get("id"):
-                continue
-
-            summary = await self._call_summary_llm(
-                summary_input_text,
-                {"model": summary_model},
-                user_data,
-                __event_call__,
-                __request__,
-                previous_summary=None,
-            )
-
-            if not summary:
-                continue
-
-            generated_summaries.append(
-                {
-                    "chat_id": ref_chat_id,
-                    "title": ref_chat_title,
-                    "summary": summary,
-                    "covers_full_history": covers_full_history,
-                    "covered_message_count": covered_message_count,
-                }
-            )
-
-            if covers_full_history and covered_message_count > 0:
-                await self._save_summary(
-                    ref_chat_id,
-                    summary,
-                    covered_message_count,
-                )
-
-        return generated_summaries
-
-    async def _save_summary(self, chat_id: str, summary: str, compressed_count: int):
-        """Saves the summary to the database (async, compatible with 0.9.0 async sessions)."""
-        try:
-            async with self._async_db_session() as session:
-                # Detect session type: async sessions expose execute as a coroutinefunction
-                if iscoroutinefunction(getattr(session, "execute", None)):
-                    # SQLAlchemy 2.0 async style (AsyncSession)
-                    from sqlalchemy import select
-
-                    result = await session.execute(
-                        select(ChatSummary).filter_by(chat_id=chat_id)
-                    )
-                    existing = result.scalars().first()
-
-                    if existing:
-                        # Optimistic lock: skip if progress hasn't advanced
-                        if compressed_count <= existing.compressed_message_count:
-                            if self.valves.debug_mode:
-                                logger.info(
-                                    f"[Storage] Skipping update: New progress ({compressed_count}) "
-                                    f"<= existing ({existing.compressed_message_count})"
-                                )
-                            return
-                        existing.summary = summary
-                        existing.compressed_message_count = compressed_count
-                        existing.updated_at = datetime.now(timezone.utc)
-                    else:
-                        new_summary = ChatSummary(
-                            chat_id=chat_id,
-                            summary=summary,
-                            compressed_message_count=compressed_count,
-                        )
-                        session.add(new_summary)
-
-                    await session.commit()
-
-                    if self.valves.debug_mode:
-                        action = "Updated" if existing else "Created"
-                        logger.info(
-                            f"[Storage] Summary has been {action.lower()} in the database (Chat ID: {chat_id})"
-                        )
-                else:
-                    # < 0.9.0: sync session (Session)
-                    existing = (
-                        session.query(ChatSummary).filter_by(chat_id=chat_id).first()
-                    )
-
-                    if existing:
-                        if compressed_count <= existing.compressed_message_count:
-                            if self.valves.debug_mode:
-                                logger.info(
-                                    f"[Storage] Skipping update: New progress ({compressed_count}) "
-                                    f"<= existing ({existing.compressed_message_count})"
-                                )
-                            return
-                        existing.summary = summary
-                        existing.compressed_message_count = compressed_count
-                        existing.updated_at = datetime.now(timezone.utc)
-                    else:
-                        new_summary = ChatSummary(
-                            chat_id=chat_id,
-                            summary=summary,
-                            compressed_message_count=compressed_count,
-                        )
-                        session.add(new_summary)
-
-                    session.commit()
-
-                    if self.valves.debug_mode:
-                        action = "Updated" if existing else "Created"
-                        logger.info(
-                            f"[Storage] Summary has been {action.lower()} in the database (Chat ID: {chat_id})"
-                        )
-
-        except Exception as e:
-            logger.error(f"[Storage] ❌ Database save failed: {str(e)}")
-
-    async def _load_summary_record(self, chat_id: str) -> Optional[ChatSummary]:
-        """Loads the summary record object from the database (async, compatible with 0.9.0)."""
-        try:
-            async with self._async_db_session() as session:
-                # Detect session type: async sessions expose execute as a coroutinefunction
-                if iscoroutinefunction(getattr(session, "execute", None)):
-                    # SQLAlchemy 2.0 async style (AsyncSession)
-                    from sqlalchemy import select
-
-                    result = await session.execute(
-                        select(ChatSummary).filter_by(chat_id=chat_id)
-                    )
-                    record = result.scalars().first()
-                    if record:
-                        return record
-                else:
-                    # < 0.9.0: sync session (Session)
-                    record = (
-                        session.query(ChatSummary).filter_by(chat_id=chat_id).first()
-                    )
-                    if record:
-                        session.expunge(record)
-                        return record
-        except Exception as e:
-            logger.error(f"[Load] ❌ Database read failed: {str(e)}")
-        return None
-
-    async def _load_summary(self, chat_id: str, body: dict) -> Optional[str]:
-        """Loads the summary text from the database (async, compatible with 0.9.0)."""
-        record = await self._load_summary_record(chat_id)
-        if record:
-            if self.valves.debug_mode:
-                logger.info(f"[Load] Loaded summary from database (Chat ID: {chat_id})")
-                logger.info(
-                    f"[Load] Last updated: {record.updated_at}, Compressed message count: {record.compressed_message_count}"
-                )
-            return record.summary
-        return None
-
-    def _count_tokens(self, text: str) -> int:
-        """Counts the number of tokens in the text."""
-        return _get_cached_tokens(text)
-
-    def _extract_text_content(self, content: Any) -> str:
-        """Extract human-readable text from string, multimodal list, or dict payloads."""
-        if isinstance(content, str):
-            return content
-
-        if isinstance(content, dict):
-            text_value = content.get("text")
-            if isinstance(text_value, str):
-                return text_value
-            nested_content = content.get("content")
-            if isinstance(nested_content, str):
-                return nested_content
-            return ""
-
-        if isinstance(content, list):
-            text_parts = []
-            for part in content:
-                if isinstance(part, dict):
-                    text_value = part.get("text")
-                    if isinstance(text_value, str) and text_value:
-                        text_parts.append(text_value)
-                        continue
-
-                    nested_content = part.get("content")
-                    if isinstance(nested_content, str) and nested_content:
-                        text_parts.append(nested_content)
-
-            return " ".join(text_parts)
-
-        return str(content) if content is not None else ""
-
-    def _message_content_char_length(self, content: Any) -> int:
-        return len(self._extract_text_content(content))
-
-    def _estimate_content_tokens(self, content: Any) -> int:
-        return _estimate_text_tokens(self._extract_text_content(content))
-
-    def _calculate_messages_tokens(self, messages: List[Dict]) -> int:
-        """Calculates the total tokens for a list of messages."""
-        start_time = time.time()
-        total_tokens = 0
-        for msg in messages:
-            content = self._extract_text_content(msg.get("content", ""))
-            total_tokens += self._count_tokens(content)
-
-        duration = (time.time() - start_time) * 1000
-        if self.valves.debug_mode:
-            logger.info(
-                f"[Token Calc] Calculated {total_tokens} tokens for {len(messages)} messages in {duration:.2f}ms"
-            )
-
-        return total_tokens
-
-    def _estimate_messages_tokens(self, messages: List[Dict]) -> int:
-        """Fast estimation of tokens using mixed-script heuristics."""
-        total_tokens = 0
-        for msg in messages:
-            total_tokens += self._estimate_content_tokens(msg.get("content", ""))
-
-        return total_tokens
-
-    def _get_model_thresholds(self, model_id: str) -> Dict[str, int]:
-        """Gets threshold configuration for a specific model.
-
-        Priority:
-        1. If configuration exists for the model ID in model_thresholds, use it.
-        2. If model is a custom model, try to match its base_model_id.
-        3. Otherwise, use global parameters compression_threshold_tokens and max_context_tokens.
-        """
-        parsed = self._parse_model_thresholds()
-
-        # 1. Direct match with model_id
-        if model_id in parsed:
-            if self.valves.debug_mode:
-                logger.info(f"[Config] Using model-specific configuration: {model_id}")
-            return parsed[model_id]
-
-        # 2. Try to find base_model_id for custom models
-        try:
-            model_obj = _call_db_sync(Models.get_model_by_id, model_id)
-            if model_obj:
-                # Check for base_model_id (custom model)
-                base_model_id = getattr(model_obj, "base_model_id", None)
-                if not base_model_id:
-                    # Try base_model_ids (array) - take first one
-                    base_model_ids = getattr(model_obj, "base_model_ids", None)
-                    if (
-                        base_model_ids
-                        and isinstance(base_model_ids, list)
-                        and len(base_model_ids) > 0
-                    ):
-                        base_model_id = base_model_ids[0]
-
-                if base_model_id and base_model_id in parsed:
-                    if self.valves.debug_mode:
-                        logger.info(
-                            f"[Config] Custom model '{model_id}' -> base_model '{base_model_id}': using base model configuration"
-                        )
-                    return parsed[base_model_id]
-        except Exception as e:
-            if self.valves.debug_mode:
-                logger.warning(
-                    f"[Config] Failed to lookup base_model for '{model_id}': {e}"
-                )
-
-        # 3. Use global default configuration
-        if self.valves.debug_mode:
-            logger.info(
-                f"[Config] Model {model_id} not in model_thresholds, using global parameters"
-            )
-
-        return {
-            "compression_threshold_tokens": self.valves.compression_threshold_tokens,
-            "max_context_tokens": self.valves.max_context_tokens,
-        }
-
-    def _get_summary_model_context_limit(self, model_id: Optional[str]) -> int:
-        """Resolve the effective input context window for summary requests."""
-        cleaned_model_id = self._clean_model_id(model_id)
-        thresholds = (
-            self._get_model_thresholds(cleaned_model_id) if cleaned_model_id else {}
-        ) or {}
-
-        if self.valves.summary_model_max_context > 0:
-            return self.valves.summary_model_max_context
-
-        return thresholds.get("max_context_tokens", self.valves.max_context_tokens)
-
-    def _get_chat_context(
-        self, body: dict, __metadata__: Optional[dict] = None
-    ) -> Dict[str, str]:
-        """
-        Unified extraction of chat context information (chat_id, message_id).
-        Prioritizes extraction from body, then metadata.
-        """
-        chat_id = ""
-        message_id = ""
-
-        # 1. Try to get from body
-        if isinstance(body, dict):
-            chat_id = body.get("chat_id", "")
-            message_id = body.get("id", "")  # message_id is usually 'id' in body
-
-            # Check body.metadata as fallback
-            if not chat_id or not message_id:
-                body_metadata = body.get("metadata", {})
-                if isinstance(body_metadata, dict):
-                    if not chat_id:
-                        chat_id = body_metadata.get("chat_id", "")
-                    if not message_id:
-                        message_id = body_metadata.get("message_id", "")
-
-        # 2. Try to get from __metadata__ (as supplement)
-        if __metadata__ and isinstance(__metadata__, dict):
-            if not chat_id:
-                chat_id = __metadata__.get("chat_id", "")
-            if not message_id:
-                message_id = __metadata__.get("message_id", "")
-
-        return {
-            "chat_id": str(chat_id).strip(),
-            "message_id": str(message_id).strip(),
-        }
 
     def _infer_native_function_calling_from_messages(self, messages: Any) -> bool:
         """Infer native function-calling mode from tool-shaped messages."""
@@ -1968,122 +1116,464 @@ class Filter:
 
         return ""
 
-    async def _emit_frontend_console_log(
-        self,
-        message: str,
-        log_type: str = "info",
-        event_call=None,
-        force: bool = False,
-    ):
-        """Emit a browser-console log, optionally bypassing the debug-log valve."""
-        if not event_call:
-            return
-        if not force and not self.valves.show_debug_log:
-            return
+# ── compression.py · History reconstruction, thresholds, compression orchestration 
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
 
-        try:
-            css = "color: #3b82f6;"
-            console_method = "log"
-            if log_type == "error":
-                css = "color: #ef4444; font-weight: bold;"
-                console_method = "error"
-            elif log_type == "warning":
-                css = "color: #f59e0b;"
-                console_method = "warn"
-            elif log_type == "success":
-                css = "color: #10b981; font-weight: bold;"
 
-            lines = message.split("\n")
-            filtered_lines = [
-                line
-                for line in lines
-                if not line.strip().startswith("====")
-                and not line.strip().startswith("----")
-            ]
-            clean_message = "\n".join(filtered_lines).strip()
+class CompressionMixin:
 
-            if not clean_message:
-                return
+    """History reconstruction, thresholds, compression orchestration."""
 
-            message_lines = [
-                line.rstrip() for line in clean_message.split("\n") if line.strip()
-            ]
-            header_line = message_lines[0] if message_lines else clean_message
-            detail_lines = message_lines[1:] if len(message_lines) > 1 else []
+    def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
+        """Get or create an asyncio lock for a specific chat ID."""
+        if chat_id not in self._chat_locks:
+            self._chat_locks[chat_id] = asyncio.Lock()
+        return self._chat_locks[chat_id]
 
-            if detail_lines:
-                js_code = f"""
-                    try {{
-                        const header = {json.dumps("[Compression] " + header_line, ensure_ascii=False)};
-                        const detailLines = {json.dumps(detail_lines, ensure_ascii=False)};
-                        console.groupCollapsed("%c" + header, "{css}");
-                        for (const line of detailLines) {{
-                            console.{console_method}(line);
-                        }}
-                        console.groupEnd();
-                        return true;
-                    }} catch (e) {{
-                        console.error("[Compression] Failed to emit console log", e);
-                        return false;
-                    }}
-                """
-            else:
-                js_code = f"""
-                    try {{
-                        console.{console_method}("%c" + {json.dumps("[Compression] " + header_line, ensure_ascii=False)}, "{css}");
-                        return true;
-                    }} catch (e) {{
-                        console.error("[Compression] Failed to emit console log", e);
-                        return false;
-                    }}
-                """
+    def _capture_pending_inlet_messages(
+        self, chat_id: str, messages: List[Dict[str, Any]]
+    ) -> None:
+        """Persist transient inlet-only messages so outlet can rebuild sent context."""
+        pending_messages = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
 
-            await asyncio.wait_for(
-                event_call({"type": "execute", "data": {"code": js_code}}),
-                timeout=2.0,
+            metadata = message.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+
+            if metadata.get("is_external_references") or metadata.get(
+                "external_references"
+            ):
+                pending_messages.append(deepcopy(message))
+
+        if pending_messages:
+            self._pending_inlet_messages[chat_id] = pending_messages
+        else:
+            self._pending_inlet_messages.pop(chat_id, None)
+
+    def _restore_pending_inlet_messages(
+        self, chat_id: str, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Reapply transient inlet-only messages after outlet rebuilds persisted history."""
+        pending_messages = self._pending_inlet_messages.pop(chat_id, None)
+        if not pending_messages:
+            return messages
+
+        restored_messages = list(messages)
+        base_keep_first = self._get_effective_keep_first(messages)
+
+        for pending_message in pending_messages:
+            if not isinstance(pending_message, dict):
+                continue
+
+            pending_content = pending_message.get("content", "")
+            if any(
+                isinstance(existing, dict)
+                and existing.get("role") == pending_message.get("role")
+                and existing.get("content", "") == pending_content
+                for existing in restored_messages
+            ):
+                continue
+
+            metadata = pending_message.get("metadata", {})
+            covered_until = (
+                metadata.get("covered_until", base_keep_first)
+                if isinstance(metadata, dict)
+                else base_keep_first
             )
-        except ValueError as ve:
-            if "broadcast" in str(ve).lower():
-                logger.debug(
-                    "Cannot broadcast to frontend without explicit room; suppressing further frontend logs in this session."
-                )
-                if not force:
-                    self.valves.show_debug_log = False
-            else:
-                logger.error(f"Failed to process log to frontend: ValueError: {ve}")
-        except Exception as e:
-            logger.error(f"Failed to process log to frontend: {type(e).__name__}: {e}")
+            try:
+                insert_index = int(covered_until)
+            except Exception:
+                insert_index = base_keep_first
 
-    async def _log(self, message: str, log_type: str = "info", event_call=None):
-        """Unified logging to both backend (print) and frontend (console.log)"""
-        # Backend logging
-        if self.valves.debug_mode:
-            logger.info(message)
+            insert_index = max(0, min(insert_index, len(restored_messages)))
+            restored_messages.insert(insert_index, deepcopy(pending_message))
 
-        await self._emit_frontend_console_log(
-            message, log_type=log_type, event_call=event_call
+        return restored_messages
+
+    def _is_summary_message(self, message: Dict[str, Any]) -> bool:
+        """Return True when the message is this filter's injected summary marker."""
+        metadata = message.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return False
+        return bool(
+            metadata.get("is_summary")
+            and metadata.get("source") == SUMMARY_METADATA_SOURCE
         )
 
-    def _should_show_status(self, usage_ratio: float) -> bool:
-        """
-        Check if token usage status should be shown based on threshold.
+    def _build_summary_message(
+        self, summary_text: str, lang: str, covered_until: int
+    ) -> Dict[str, Any]:
+        """Create a summary marker message with original-history progress metadata."""
+        summary_content = (
+            self._get_translation(lang, "summary_prompt_prefix")
+            + f"{summary_text}"
+            + self._get_translation(lang, "summary_prompt_suffix")
+        )
+        return {
+            "role": "assistant",
+            "content": summary_content,
+            "metadata": {
+                "is_summary": True,
+                "source": SUMMARY_METADATA_SOURCE,
+                "covered_until": max(0, int(covered_until)),
+            },
+        }
 
-        Args:
-            usage_ratio: Current usage ratio (0.0 to 1.0)
-
-        Returns:
-            True if status should be shown, False otherwise
-        """
-        if not self.valves.show_token_usage_status:
+    def _is_external_reference_message(self, message: Dict[str, Any]) -> bool:
+        metadata = message.get("metadata", {})
+        if not isinstance(metadata, dict):
             return False
+        return bool(
+            metadata.get("is_external_references")
+            or metadata.get("source") == "external_references"
+        )
 
-        # If threshold is 0, always show
-        if self.valves.token_usage_status_threshold == 0:
-            return True
+    def _get_summary_view_state(self, messages: List[Dict]) -> Dict[str, Optional[int]]:
+        """Inspect the current message view and recover summary marker metadata."""
+        for index, message in enumerate(messages):
+            if self._is_external_reference_message(message):
+                continue
+            if not self._is_summary_message(message):
+                continue
 
-        # Check if usage exceeds threshold
-        threshold_ratio = self.valves.token_usage_status_threshold / 100.0
-        return usage_ratio >= threshold_ratio
+            metadata = message.get("metadata", {})
+            covered_until = metadata.get("covered_until", 0)
+            if not isinstance(covered_until, int) or covered_until < 0:
+                covered_until = 0
+
+            return {
+                "summary_index": index,
+                "base_progress": covered_until,
+            }
+
+        return {"summary_index": None, "base_progress": 0}
+
+    def _get_original_history_count(self, messages: List[Dict]) -> int:
+        """Map the current visible message list back to original-history size."""
+        summary_state = self._get_summary_view_state(messages)
+        summary_index = summary_state["summary_index"]
+        base_progress = summary_state["base_progress"] or 0
+
+        if summary_index is None:
+            return len(messages)
+
+        return base_progress + max(0, len(messages) - summary_index - 1)
+
+    def _calculate_target_compressed_count(self, messages: List[Dict]) -> int:
+        """Calculate the next summary boundary in original-history coordinates."""
+        summary_state = self._get_summary_view_state(messages)
+        summary_index = summary_state["summary_index"]
+        base_progress = summary_state["base_progress"] or 0
+
+        original_count = self._get_original_history_count(messages)
+        raw_target = max(base_progress, original_count - self.valves.keep_last)
+
+        if summary_index is None:
+            protected_prefix = self._get_effective_keep_first(messages)
+            return self._align_tail_start_to_atomic_boundary(
+                messages, raw_target, protected_prefix
+            )
+
+        if raw_target <= base_progress:
+            return base_progress
+
+        tail_messages = messages[summary_index + 1 :]
+        local_target = raw_target - base_progress
+        aligned_local_target = self._align_tail_start_to_atomic_boundary(
+            tail_messages, local_target, 0
+        )
+        return base_progress + aligned_local_target
+
+    def _reconstruct_active_history_branch(
+        self, history_messages: Any, current_id: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """Rebuild the active chat branch from OpenWebUI `history.messages` data."""
+        if not isinstance(history_messages, dict) or not history_messages:
+            return []
+
+        if isinstance(current_id, str) and current_id in history_messages:
+            ordered_messages: List[Dict[str, Any]] = []
+            visited = set()
+            cursor = current_id
+
+            while isinstance(cursor, str) and cursor and cursor not in visited:
+                visited.add(cursor)
+                node = history_messages.get(cursor)
+                if not isinstance(node, dict):
+                    break
+
+                ordered_messages.append(deepcopy(node))
+                cursor = node.get("parentId") or node.get("parent_id")
+
+            if ordered_messages:
+                ordered_messages.reverse()
+                return ordered_messages
+
+        sortable_messages = []
+        for index, node in enumerate(history_messages.values()):
+            if not isinstance(node, dict):
+                continue
+
+            timestamp = node.get("timestamp")
+            if not isinstance(timestamp, (int, float)):
+                timestamp = node.get("created_at")
+            if not isinstance(timestamp, (int, float)):
+                timestamp = index
+
+            sortable_messages.append((float(timestamp), index, deepcopy(node)))
+
+        sortable_messages.sort(key=lambda item: (item[0], item[1]))
+        return [message for _, _, message in sortable_messages]
+
+    async def _load_full_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
+        """Load the full persisted chat history for summary decisions when available."""
+        if not chat_id or Chats is None:
+            return []
+
+        try:
+            chat_record = await _call_db(Chats.get_chat_by_id, chat_id)
+        except Exception as exc:
+            logger.warning(f"[Chat Load] Failed to fetch chat {chat_id}: {exc}")
+            return []
+
+        chat_payload = getattr(chat_record, "chat", None)
+        if not isinstance(chat_payload, dict):
+            return []
+
+        direct_messages = chat_payload.get("messages")
+        if isinstance(direct_messages, list) and direct_messages:
+            return deepcopy(direct_messages)
+
+        history = chat_payload.get("history")
+        if not isinstance(history, dict):
+            return []
+
+        history_messages = history.get("messages")
+        if not isinstance(history_messages, dict) or not history_messages:
+            return []
+
+        current_id = history.get("currentId") or history.get("current_id")
+        return self._reconstruct_active_history_branch(history_messages, current_id)
+
+    def _get_effective_keep_first(self, messages: List[Dict]) -> int:
+        """
+        Calculate the index to protect the first N NON-SYSTEM messages.
+        All system messages encountered before reaching the Nth non-system message are also kept.
+        """
+        if not messages or self.valves.keep_first <= 0:
+            return 0
+
+        non_system_count = 0
+
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "system":
+                non_system_count += 1
+
+            if non_system_count >= self.valves.keep_first:
+                return i + 1
+
+        # All messages scanned but never reached keep_first non-system messages;
+        # protect everything we have.
+        return len(messages)
+
+    async def _get_user_context(
+        self,
+        __user__: Optional[Dict[str, Any]],
+        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> Dict[str, str]:
+        """Extract basic user context with safe fallbacks."""
+        if isinstance(__user__, (list, tuple)):
+            user_data = __user__[0] if __user__ else {}
+        elif isinstance(__user__, dict):
+            user_data = __user__
+        else:
+            user_data = {}
+
+        user_id = user_data.get("id", "unknown_user")
+        user_name = user_data.get("name", "User")
+        user_language = user_data.get("language", "en-US")
+
+        if __event_call__:
+            try:
+                js_code = """
+                    try {
+                        return (
+                            document.documentElement.lang ||
+                            localStorage.getItem('locale') ||
+                            localStorage.getItem('language') ||
+                            navigator.language ||
+                            'en-US'
+                        );
+                    } catch (e) {
+                        return 'en-US';
+                    }
+                """
+                frontend_lang = await asyncio.wait_for(
+                    __event_call__({"type": "execute", "data": {"code": js_code}}),
+                    timeout=2.0,
+                )
+                if frontend_lang and isinstance(frontend_lang, str):
+                    user_language = frontend_lang
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Failed to retrieve frontend language: Timeout (using fallback)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to retrieve frontend language: {type(e).__name__}: {e}"
+                )
+
+        return {
+            "user_id": user_id,
+            "user_name": user_name,
+            "user_language": user_language,
+        }
+
+    def _parse_model_thresholds(self) -> Dict[str, Any]:
+        """Parse model_thresholds string into a dictionary.
+
+        Format: model_id:compression_threshold:max_context, model_id2:threshold2:max2
+        Example: gpt-4:8000:32000, claude-3:100000:200000
+
+        Returns cached result if already parsed.
+        """
+        if self._model_thresholds_cache is not None:
+            return self._model_thresholds_cache
+
+        self._model_thresholds_cache = {}
+        raw_config = self.valves.model_thresholds
+        if not raw_config:
+            return self._model_thresholds_cache
+
+        for entry in raw_config.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+
+            parts = entry.split(":")
+            if len(parts) != 3:
+                continue
+
+            try:
+                model_id = parts[0].strip()
+                compression_threshold = int(parts[1].strip())
+                max_context = int(parts[2].strip())
+
+                self._model_thresholds_cache[model_id] = {
+                    "compression_threshold_tokens": compression_threshold,
+                    "max_context_tokens": max_context,
+                }
+            except ValueError:
+                continue
+
+        return self._model_thresholds_cache
+
+    def _get_model_thresholds(self, model_id: str) -> Dict[str, int]:
+        """Gets threshold configuration for a specific model.
+
+        Priority:
+        1. If configuration exists for the model ID in model_thresholds, use it.
+        2. If model is a custom model, try to match its base_model_id.
+        3. Otherwise, use global parameters compression_threshold_tokens and max_context_tokens.
+        """
+        parsed = self._parse_model_thresholds()
+
+        # 1. Direct match with model_id
+        if model_id in parsed:
+            if self.valves.debug_mode:
+                logger.info(f"[Config] Using model-specific configuration: {model_id}")
+            return parsed[model_id]
+
+        # 2. Try to find base_model_id for custom models
+        try:
+            model_obj = _call_db_sync(Models.get_model_by_id, model_id)
+            if model_obj:
+                # Check for base_model_id (custom model)
+                base_model_id = getattr(model_obj, "base_model_id", None)
+                if not base_model_id:
+                    # Try base_model_ids (array) - take first one
+                    base_model_ids = getattr(model_obj, "base_model_ids", None)
+                    if (
+                        base_model_ids
+                        and isinstance(base_model_ids, list)
+                        and len(base_model_ids) > 0
+                    ):
+                        base_model_id = base_model_ids[0]
+
+                if base_model_id and base_model_id in parsed:
+                    if self.valves.debug_mode:
+                        logger.info(
+                            f"[Config] Custom model '{model_id}' -> base_model '{base_model_id}': using base model configuration"
+                        )
+                    return parsed[base_model_id]
+        except Exception as e:
+            if self.valves.debug_mode:
+                logger.warning(
+                    f"[Config] Failed to lookup base_model for '{model_id}': {e}"
+                )
+
+        # 3. Use global default configuration
+        if self.valves.debug_mode:
+            logger.info(
+                f"[Config] Model {model_id} not in model_thresholds, using global parameters"
+            )
+
+        return {
+            "compression_threshold_tokens": self.valves.compression_threshold_tokens,
+            "max_context_tokens": self.valves.max_context_tokens,
+        }
+
+    def _get_summary_model_context_limit(self, model_id: Optional[str]) -> int:
+        """Resolve the effective input context window for summary requests."""
+        cleaned_model_id = self._clean_model_id(model_id)
+        thresholds = (
+            self._get_model_thresholds(cleaned_model_id) if cleaned_model_id else {}
+        ) or {}
+
+        if self.valves.summary_model_max_context > 0:
+            return self.valves.summary_model_max_context
+
+        return thresholds.get("max_context_tokens", self.valves.max_context_tokens)
+
+    def _get_chat_context(
+        self, body: dict, __metadata__: Optional[dict] = None
+    ) -> Dict[str, str]:
+        """
+        Unified extraction of chat context information (chat_id, message_id).
+        Prioritizes extraction from body, then metadata.
+        """
+        chat_id = ""
+        message_id = ""
+
+        # 1. Try to get from body
+        if isinstance(body, dict):
+            chat_id = body.get("chat_id", "")
+            message_id = body.get("id", "")  # message_id is usually 'id' in body
+
+            # Check body.metadata as fallback
+            if not chat_id or not message_id:
+                body_metadata = body.get("metadata", {})
+                if isinstance(body_metadata, dict):
+                    if not chat_id:
+                        chat_id = body_metadata.get("chat_id", "")
+                    if not message_id:
+                        message_id = body_metadata.get("message_id", "")
+
+        # 2. Try to get from __metadata__ (as supplement)
+        if __metadata__ and isinstance(__metadata__, dict):
+            if not chat_id:
+                chat_id = __metadata__.get("chat_id", "")
+            if not message_id:
+                message_id = __metadata__.get("message_id", "")
+
+        return {
+            "chat_id": str(chat_id).strip(),
+            "message_id": str(message_id).strip(),
+        }
 
     def _should_skip_compression(
         self, body: dict, __model__: Optional[dict] = None
@@ -2110,851 +1600,6 @@ class Filter:
             ):
                 return True
         return False
-
-    async def inlet(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        __metadata__: dict = None,
-        __request__: Request = None,
-        __model__: dict = None,
-        __event_emitter__: Callable[[Any], Awaitable[None]] = None,
-        __event_call__: Callable[[Any], Awaitable[None]] = None,
-    ) -> dict:
-        """
-        Executed before sending to the LLM.
-        Compression Strategy: Only responsible for injecting existing summaries, no Token calculation.
-        """
-
-        if self._should_skip_compression(body, __model__):
-            if self.valves.debug_mode:
-                logger.info(
-                    "[Inlet] Skipping compression: copilot_sdk detected in base model"
-                )
-            return body
-
-        messages = body.get("messages", [])
-        user_ctx = await self._get_user_context(__user__, __event_call__)
-        lang = user_ctx["user_language"]
-
-        normalized_tool_call_count = self._normalize_native_tool_call_ids(messages)
-        if (
-            normalized_tool_call_count > 0
-            and self.valves.show_debug_log
-            and __event_call__
-        ):
-            await self._log(
-                f"[Inlet] 🪪 Normalized {normalized_tool_call_count} overlong tool call ID(s).",
-                event_call=__event_call__,
-            )
-
-        # --- Native Tool Output Trimming (Opt-in, only for native function calling) ---
-        function_calling_mode = self._get_function_calling_mode(body)
-        is_native_func_calling = function_calling_mode == "native"
-
-        if self.valves.show_debug_log and __event_call__:
-            trimming_state = (
-                "enabled" if self.valves.enable_tool_output_trimming else "disabled"
-            )
-            await self._log(
-                "[Inlet] ✂️ Tool trimming check: "
-                f"state={trimming_state}, function_calling={function_calling_mode or 'unset'}, "
-                f"message_count={len(messages)}",
-                event_call=__event_call__,
-            )
-
-        if self.valves.enable_tool_output_trimming and is_native_func_calling:
-            trimmed_count, trim_debug = self._trim_native_tool_outputs(
-                messages,
-                lang,
-                collect_debug=bool(self.valves.show_debug_log and __event_call__),
-            )
-        elif self.valves.show_debug_log and __event_call__:
-            skip_reason = (
-                "tool trimming disabled"
-                if not self.valves.enable_tool_output_trimming
-                else f"function_calling={function_calling_mode or 'unset'}"
-            )
-            await self._log(
-                f"[Inlet] ✂️ Tool trimming skipped: {skip_reason}.",
-                event_call=__event_call__,
-            )
-
-        chat_ctx = self._get_chat_context(body, __metadata__)
-        chat_id = chat_ctx["chat_id"]
-
-        body = await self._handle_external_chat_references(
-            body,
-            user_data=__user__,
-            __event_call__=__event_call__,
-            __request__=__request__,
-        )
-        messages = body.get("messages", [])
-
-        # Extract system prompt for accurate token calculation
-        # 1. For custom models: check DB (Models.get_model_by_id)
-        # 2. For base models: check messages for role='system'
-        system_prompt_content = None
-
-        # Try to get from DB (custom model)
-        # Try to get from DB (custom model)
-        try:
-            model_id = body.get("model")
-            if model_id:
-                if self.valves.show_debug_log and __event_call__:
-                    await self._log(
-                        f"[Inlet] 🔍 Attempting DB lookup for model: {model_id}",
-                        event_call=__event_call__,
-                    )
-
-                # Clean model ID if needed (though get_model_by_id usually expects the full ID)
-                # Version-aware DB call (async on >=0.9.0, sync on <0.9.0)
-                model_obj = await _call_db(Models.get_model_by_id, model_id)
-
-                if model_obj:
-                    if self.valves.show_debug_log and __event_call__:
-                        await self._log(
-                            f"[Inlet] ✅ Model found in DB: {model_obj.name} (ID: {model_obj.id})",
-                            event_call=__event_call__,
-                        )
-
-                    if model_obj.params:
-                        try:
-                            params = model_obj.params
-                            # Handle case where params is a JSON string
-                            if isinstance(params, str):
-                                params = json.loads(params)
-                            # Convert Pydantic model to dict if needed
-                            elif hasattr(params, "model_dump"):
-                                params = params.model_dump()
-                            elif hasattr(params, "dict"):
-                                params = params.dict()
-
-                            # Now params should be a dict
-                            if isinstance(params, dict):
-                                system_prompt_content = params.get("system")
-                            else:
-                                # Fallback: try getattr
-                                system_prompt_content = getattr(params, "system", None)
-
-                            if system_prompt_content:
-                                if self.valves.show_debug_log and __event_call__:
-                                    await self._log(
-                                        f"[Inlet] 📝 System prompt found in DB params ({len(system_prompt_content)} chars)",
-                                        event_call=__event_call__,
-                                    )
-                            else:
-                                if self.valves.show_debug_log and __event_call__:
-                                    await self._log(
-                                        f"[Inlet] ⚠️ 'system' key missing in model params",
-                                        event_call=__event_call__,
-                                    )
-                        except Exception as e:
-                            if self.valves.show_debug_log and __event_call__:
-                                await self._log(
-                                    f"[Inlet] ❌ Failed to parse model params: {e}",
-                                    log_type="error",
-                                    event_call=__event_call__,
-                                )
-
-                    else:
-                        if self.valves.show_debug_log and __event_call__:
-                            await self._log(
-                                f"[Inlet] ⚠️ Model params are empty",
-                                event_call=__event_call__,
-                            )
-                else:
-                    if self.valves.show_debug_log and __event_call__:
-                        await self._log(
-                            f"[Inlet] ℹ️ Not a custom model, skipping custom system prompt check",
-                            event_call=__event_call__,
-                        )
-
-        except Exception as e:
-            if self.valves.show_debug_log and __event_call__:
-                await self._log(
-                    f"[Inlet] ❌ Error fetching system prompt from DB: {e}",
-                    log_type="error",
-                    event_call=__event_call__,
-                )
-            if self.valves.debug_mode:
-                logger.error(f"[Inlet] Error fetching system prompt from DB: {e}")
-
-        # Fall back to checking messages (base model or already included)
-        if not system_prompt_content:
-            for msg in messages:
-                if msg.get("role") == "system":
-                    system_prompt_content = msg.get("content", "")
-                    break
-
-        # Build system_prompt_msg for token calculation
-        system_prompt_msg = None
-        if system_prompt_content:
-            system_prompt_msg = {"role": "system", "content": system_prompt_content}
-            if self.valves.debug_mode:
-                logger.info(
-                    f"[Inlet] Found system prompt ({len(system_prompt_content)} chars). Including in budget."
-                )
-
-        # Log message statistics (Moved here to include extracted system prompt)
-        if self.valves.show_debug_log and __event_call__:
-            try:
-                msg_stats = {
-                    "user": 0,
-                    "assistant": 0,
-                    "system": 0,
-                    "total": len(messages),
-                }
-                for msg in messages:
-                    role = msg.get("role", "unknown")
-                    if role in msg_stats:
-                        msg_stats[role] += 1
-
-                # If system prompt was extracted from DB/Model but not in messages, count it
-                if system_prompt_content:
-                    # Check if it's already counted (i.e., was in messages)
-                    is_in_messages = any(m.get("role") == "system" for m in messages)
-                    if not is_in_messages:
-                        msg_stats["system"] += 1
-                        msg_stats["total"] += 1
-
-                stats_str = f"Total: {msg_stats['total']} | User: {msg_stats['user']} | Assistant: {msg_stats['assistant']} | System: {msg_stats['system']}"
-                await self._log(
-                    f"[Inlet] Message Stats: {stats_str}", event_call=__event_call__
-                )
-            except Exception as e:
-                logger.error(f"[Inlet] Error logging message stats: {e}")
-
-        if not chat_id:
-            await self._log(
-                "[Inlet] ❌ Missing chat_id in metadata, skipping compression",
-                log_type="error",
-                event_call=__event_call__,
-            )
-            return body
-
-        if self.valves.debug_mode or self.valves.show_debug_log:
-            await self._log(
-                f"\n{'='*60}\n[Inlet] Chat ID: {chat_id}\n[Inlet] Received {len(messages)} messages",
-                event_call=__event_call__,
-            )
-
-            # Log custom model configurations
-            raw_config = self.valves.model_thresholds
-            parsed_configs = self._parse_model_thresholds()
-
-            if raw_config:
-                config_list = [
-                    f"{model}: {cfg['compression_threshold_tokens']}t/{cfg['max_context_tokens']}t"
-                    for model, cfg in parsed_configs.items()
-                ]
-
-                if config_list:
-                    await self._log(
-                        f"[Inlet] 📋 Model Configs (Raw: '{raw_config}'): {', '.join(config_list)}",
-                        event_call=__event_call__,
-                    )
-                else:
-                    await self._log(
-                        f"[Inlet] ⚠️ Invalid Model Configs (Raw: '{raw_config}'): No valid configs parsed. Expected format: 'model_id:threshold:max_context'",
-                        log_type="warning",
-                        event_call=__event_call__,
-                    )
-            else:
-                await self._log(
-                    f"[Inlet] 📋 Model Configs: No custom configuration (Global defaults only)",
-                    event_call=__event_call__,
-                )
-
-        # Log the aligned compression boundary using the same original-history
-        # coordinate mapping as outlet/async summary generation.
-        target_compressed_count = self._calculate_target_compressed_count(messages)
-
-        await self._log(
-            f"[Inlet] Recorded target compression progress: {target_compressed_count}",
-            event_call=__event_call__,
-        )
-
-        # Load summary record
-        summary_record = await self._load_summary_record(chat_id)
-
-        # Calculate effective_keep_first to ensure all system messages are protected
-        effective_keep_first = self._get_effective_keep_first(messages)
-
-        final_messages = []
-        external_refs_injected_count = 0
-
-        if summary_record:
-            # Summary exists, build view: [Head] + [Summary Message] + [Tail]
-            # Tail is all messages after the last compression point
-            compressed_count = summary_record.compressed_message_count
-
-            # Ensure compressed_count is reasonable
-            if compressed_count > len(messages):
-                compressed_count = max(0, len(messages) - self.valves.keep_last)
-
-            # 1. Head messages (Keep First)
-            head_messages = []
-            if effective_keep_first > 0:
-                head_messages = messages[:effective_keep_first]
-
-            # 2. Tail messages (Tail) - All messages starting from the last compression point.
-            # Align legacy/raw progress to an atomic boundary so old summary rows do not
-            # reintroduce orphaned tool messages into the retained tail.
-            raw_start_index = max(compressed_count, effective_keep_first)
-            start_index = self._align_tail_start_to_atomic_boundary(
-                messages, raw_start_index, effective_keep_first
-            )
-
-            # --- Extract Preserved System Messages from the Gap ---
-            # Any system message in the gap (messages[effective_keep_first:start_index])
-            # must be preserved according to policy.
-            gap_messages = messages[effective_keep_first:start_index]
-            preserved_system_messages = [
-                msg
-                for msg in gap_messages
-                if isinstance(msg, dict) and msg.get("role") == "system"
-            ]
-
-            # 3. Summary message (Inserted as Assistant message)
-            external_refs = body.pop("__external_references__", None)
-            summary_msg = self._build_summary_message(
-                summary_record.summary,
-                lang,
-                start_index,
-            )
-
-            if external_refs:
-                external_content = external_refs.get("content", "")
-                if external_content:
-                    external_refs_injected_count = len(
-                        external_refs.get("references", [])
-                    )
-                    summary_msg["content"] = (
-                        f"<external_references>\n{external_content}\n</external_references>\n\n"
-                        + summary_msg["content"]
-                    )
-                    summary_msg["metadata"]["external_references"] = external_refs.get(
-                        "references", []
-                    )
-
-            tail_messages = messages[start_index:]
-
-            # --- Preflight Check & Budgeting (Simplified) ---
-
-            # Assemble candidate messages (for output)
-            candidate_messages = (
-                head_messages
-                + [summary_msg]
-                + preserved_system_messages
-                + tail_messages
-            )
-
-            # Prepare messages for token calculation (include system prompt if missing)
-            calc_messages = candidate_messages
-            if system_prompt_msg:
-                # Check if system prompt is already in head_messages
-                is_in_head = any(m.get("role") == "system" for m in head_messages)
-                if not is_in_head:
-                    calc_messages = [system_prompt_msg] + candidate_messages
-
-            # Get max context limit
-            model = self._clean_model_id(body.get("model"))
-            thresholds = self._get_model_thresholds(model)
-            max_context_tokens = thresholds.get(
-                "max_context_tokens", self.valves.max_context_tokens
-            )
-
-            # --- Fast Estimation Check ---
-            estimated_tokens = self._estimate_messages_tokens(calc_messages)
-
-            # Since this is a hard limit check, only skip precise calculation if we are far below it (margin of 15%)
-            # max_context_tokens == 0 means "no limit", skip reduction entirely
-            if max_context_tokens <= 0:
-                total_tokens = estimated_tokens
-                await self._log(
-                    f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
-                    event_call=__event_call__,
-                )
-            elif estimated_tokens < max_context_tokens * 0.85:
-                total_tokens = estimated_tokens
-                await self._log(
-                    "[Inlet] 🔎 Sent-context preflight (estimated)\n"
-                    f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | status=well_within_limit",
-                    event_call=__event_call__,
-                )
-            else:
-                # Calculate exact total tokens via tiktoken
-                total_tokens = await asyncio.to_thread(
-                    self._calculate_messages_tokens, calc_messages
-                )
-
-                # Preflight Check Log
-                await self._log(
-                    "[Inlet] 🔎 Sent-context preflight (precise)\n"
-                    f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | usage={(total_tokens/max_context_tokens*100):.1f}%",
-                    event_call=__event_call__,
-                )
-
-                # Identify atomic groups to avoid breaking tool-calling context
-                atomic_groups = self._get_atomic_groups(tail_messages)
-
-                while total_tokens > max_context_tokens and len(atomic_groups) > 1:
-                    # Strategy 1: Structure-Aware Assistant Trimming (Optional, only for non-tool messages)
-                    # For simplicity and reliability in this fix, we prioritize Group-Drop over partial trim
-                    # if a group contains tool calls.
-
-                    # Strategy 2: Drop Oldest Atomic Group Entirely
-                    dropped_group_indices = atomic_groups.pop(0)
-                    # Note: indices in dropped_group_indices are relative to ORIGINAL tail_messages
-                    # But since we are popping from tail_messages itself, we need to be careful.
-
-                    # Extract and drop messages in this group from the actual list
-                    # Since we always pop group 0, we pop len(dropped_group_indices) times from front
-                    dropped_tokens = 0
-                    for _ in range(len(dropped_group_indices)):
-                        dropped = tail_messages.pop(0)
-                        if total_tokens == estimated_tokens:
-                            dropped_tokens += self._estimate_content_tokens(
-                                dropped.get("content", "")
-                            )
-                        else:
-                            dropped_tokens += self._count_tokens(
-                                str(dropped.get("content", ""))
-                            )
-
-                    total_tokens -= dropped_tokens
-
-                    if self.valves.show_debug_log and __event_call__:
-                        await self._log(
-                            f"[Inlet] 🗑️ Dropped atomic group ({len(dropped_group_indices)} msgs) to fit context. Tokens: {dropped_tokens}",
-                            event_call=__event_call__,
-                        )
-
-                # Re-assemble
-                candidate_messages = (
-                    head_messages
-                    + [summary_msg]
-                    + preserved_system_messages
-                    + tail_messages
-                )
-
-                await self._log(
-                    "[Inlet] ✂️ Sent-context history reduced\n"
-                    f"sent_context_tokens={total_tokens} | tail_size={len(tail_messages)}",
-                    event_call=__event_call__,
-                )
-
-            final_messages = candidate_messages
-
-            # Calculate detailed token stats for logging
-            summary_content = summary_msg.get("content", "")
-            if total_tokens == estimated_tokens:
-                system_tokens = (
-                    self._estimate_content_tokens(system_prompt_msg.get("content", ""))
-                    if system_prompt_msg
-                    else 0
-                )
-                head_tokens = self._estimate_messages_tokens(head_messages)
-                summary_tokens = self._estimate_content_tokens(summary_content)
-                preserved_system_tokens = self._estimate_messages_tokens(
-                    preserved_system_messages
-                )
-                tail_tokens = self._estimate_messages_tokens(tail_messages)
-            else:
-                system_tokens = (
-                    self._count_tokens(system_prompt_msg.get("content", ""))
-                    if system_prompt_msg
-                    else 0
-                )
-                head_tokens = self._calculate_messages_tokens(head_messages)
-                summary_tokens = self._count_tokens(summary_content)
-                preserved_system_tokens = self._calculate_messages_tokens(
-                    preserved_system_messages
-                )
-                tail_tokens = self._calculate_messages_tokens(tail_messages)
-
-            system_info = (
-                f"System({system_tokens + preserved_system_tokens}t)"
-                if (system_prompt_msg or preserved_system_messages)
-                else "System(0t)"
-            )
-
-            total_section_tokens = (
-                system_tokens
-                + head_tokens
-                + summary_tokens
-                + preserved_system_tokens
-                + tail_tokens
-            )
-
-            await self._log(
-                "[Inlet] ✅ Sent context assembled\n"
-                f"sent_context_tokens={total_section_tokens} | {system_info} + Head({len(head_messages)} msg, {head_tokens}t) + Summary({summary_tokens}t) + Tail({len(tail_messages)} msg, {tail_tokens}t)",
-                log_type="success",
-                event_call=__event_call__,
-            )
-
-            # Prepare status message (Context Usage format)
-            if max_context_tokens > 0:
-                usage_ratio = total_section_tokens / max_context_tokens
-                # Only show status if threshold is met
-                if self._should_show_status(usage_ratio):
-                    status_msg = self._get_translation(
-                        lang,
-                        "status_context_usage",
-                        tokens=total_section_tokens,
-                        max_tokens=max_context_tokens,
-                        ratio=f"{usage_ratio*100:.1f}",
-                    )
-                    if usage_ratio > 0.9:
-                        status_msg += self._get_translation(lang, "status_high_usage")
-
-                    if __event_emitter__:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": status_msg,
-                                    "done": True,
-                                },
-                            }
-                        )
-            else:
-                # For the case where max_context_tokens is 0, show summary info without threshold check
-                if self.valves.show_token_usage_status and __event_emitter__:
-                    status_msg = self._get_translation(
-                        lang, "status_loaded_summary", count=compressed_count
-                    )
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": status_msg,
-                                "done": True,
-                            },
-                        }
-                    )
-
-        else:
-            external_refs = body.pop("__external_references__", None)
-
-            if external_refs and external_refs.get("content") and messages:
-                external_content = external_refs.get("content", "")
-                external_refs_injected_count = len(external_refs.get("references", []))
-                ref_msg = {
-                    "role": "assistant",
-                    "content": (
-                        f"<external_references>\n{external_content}\n</external_references>\n\n"
-                        + "Here are references to other conversations that may be relevant to this discussion."
-                    ),
-                    "metadata": {
-                        "is_summary": True,
-                        "is_external_references": True,
-                        "source": "external_references",
-                        "covered_until": effective_keep_first,
-                        "external_references": external_refs.get("references", []),
-                    },
-                }
-
-                head_messages = messages[:effective_keep_first]
-                tail_messages = messages[effective_keep_first:]
-                candidate_messages = head_messages + [ref_msg] + tail_messages
-
-                if __event_call__:
-                    await self._log(
-                        f"[Inlet] 📎 💉 Injected {external_refs_injected_count} external chat reference(s) as contextual block (head: {len(head_messages)}, tail: {len(tail_messages)})",
-                        event_call=__event_call__,
-                    )
-            else:
-                candidate_messages = messages if messages else []
-
-            if not candidate_messages:
-                return body
-
-            final_messages = candidate_messages
-
-            calc_messages = candidate_messages
-            if system_prompt_msg:
-                is_in_messages = any(
-                    m.get("role") == "system" for m in candidate_messages
-                )
-                if not is_in_messages:
-                    calc_messages = [system_prompt_msg] + candidate_messages
-
-            # Get max context limit
-            model = self._clean_model_id(body.get("model"))
-            thresholds = self._get_model_thresholds(model) or {}
-            max_context_tokens = thresholds.get(
-                "max_context_tokens", self.valves.max_context_tokens
-            )
-
-            # --- Fast Estimation Check ---
-            estimated_tokens = self._estimate_messages_tokens(calc_messages)
-
-            # Only skip precise calculation if we are clearly below the limit
-            # max_context_tokens == 0 means "no limit", skip reduction entirely
-            if max_context_tokens <= 0:
-                total_tokens = estimated_tokens
-                await self._log(
-                    f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
-                    event_call=__event_call__,
-                )
-            elif estimated_tokens < max_context_tokens * 0.85:
-                total_tokens = estimated_tokens
-                await self._log(
-                    f"[Inlet] 🔎 Fast limit check (Est): {total_tokens}t / {max_context_tokens}t",
-                    event_call=__event_call__,
-                )
-            else:
-                total_tokens = await asyncio.to_thread(
-                    self._calculate_messages_tokens, calc_messages
-                )
-
-            if total_tokens > max_context_tokens and max_context_tokens > 0:
-                await self._log(
-                    f"[Inlet] ⚠️ Original messages ({total_tokens} Tokens) exceed limit ({max_context_tokens}). Reducing history...",
-                    log_type="warning",
-                    event_call=__event_call__,
-                )
-
-                # Use atomic grouping to preserve tool-calling integrity
-                trimmable = candidate_messages[effective_keep_first:]
-                atomic_groups = self._get_atomic_groups(trimmable)
-
-                # To follow policy "system messages never lost", we maintain a list of
-                # system messages that were part of dropped groups.
-                dropped_but_preserved_systems = []
-
-                while total_tokens > max_context_tokens and len(atomic_groups) > 1:
-                    dropped_group_indices = atomic_groups.pop(0)
-                    dropped_tokens = 0
-                    for _ in range(len(dropped_group_indices)):
-                        dropped = trimmable.pop(0)
-
-                        # Absolute protections:
-                        # 1. External references (often large and specialized)
-                        # 2. System messages (instructions)
-                        if self._is_external_reference_message(dropped):
-                            trimmable.insert(0, dropped)
-                            # Stop dropping this group if we hit a protected message
-                            # (Though groups should be pure, this is a safety net)
-                            break
-
-                        if (
-                            isinstance(dropped, dict)
-                            and dropped.get("role") == "system"
-                        ):
-                            dropped_but_preserved_systems.append(dropped)
-                            # Even if preserved, it counts as "dropped" from the trimmable flow
-                            # to avoid infinite loop, but its tokens remain in the budget.
-                            # We don't subtract its tokens here.
-                            continue
-
-                        if total_tokens == estimated_tokens:
-                            dropped_tokens += self._estimate_content_tokens(
-                                dropped.get("content", "")
-                            )
-                        else:
-                            dropped_tokens += self._count_tokens(
-                                str(dropped.get("content", ""))
-                            )
-                    total_tokens -= dropped_tokens
-
-                # Re-assemble: [Head] + [Preserved Systems from Dropped Groups] + [Remaining Trimmable/Tail]
-                candidate_messages = (
-                    candidate_messages[:effective_keep_first]
-                    + dropped_but_preserved_systems
-                    + trimmable
-                )
-
-                await self._log(
-                    f"[Inlet] ✂️ Messages reduced (atomic). New total: {total_tokens} Tokens",
-                    event_call=__event_call__,
-                )
-
-            # Send status notification (Context Usage format)
-            if max_context_tokens > 0:
-                usage_ratio = total_tokens / max_context_tokens
-                # Only show status if threshold is met
-                if self._should_show_status(usage_ratio):
-                    status_msg = self._get_translation(
-                        lang,
-                        "status_context_usage",
-                        tokens=total_tokens,
-                        max_tokens=max_context_tokens,
-                        ratio=f"{usage_ratio*100:.1f}",
-                    )
-                    if usage_ratio > 0.9:
-                        status_msg += self._get_translation(lang, "status_high_usage")
-
-                    if __event_emitter__:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": status_msg,
-                                    "done": True,
-                                },
-                            }
-                        )
-
-        body["messages"] = final_messages
-        self._capture_pending_inlet_messages(chat_id, final_messages)
-
-        await self._log(
-            f"[Inlet] ✅ Final send\nsent_message_count={len(body['messages'])}\n{'='*60}\n",
-            event_call=__event_call__,
-        )
-
-        metadata = body.get("metadata", {})
-        files = metadata.get("files", [])
-        if files:
-            new_files = [f for f in files if f.get("type") != "chat"]
-            if len(new_files) != len(files):
-                metadata["files"] = new_files
-                body["metadata"] = metadata
-                if __event_call__:
-                    await self._log(
-                        f"[Inlet] 🗑️ Removed {len(files) - len(new_files)} chat reference(s) from files to prevent RAG",
-                        event_call=__event_call__,
-                    )
-
-        if external_refs_injected_count > 0 and __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": self._get_translation(
-                            lang,
-                            "status_external_refs_injected",
-                            count=external_refs_injected_count,
-                        ),
-                        "done": True,
-                    },
-                }
-            )
-
-        return body
-
-    async def outlet(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        __metadata__: dict = None,
-        __model__: dict = None,
-        __event_emitter__: Callable[[Any], Awaitable[None]] = None,
-        __event_call__: Callable[[Any], Awaitable[None]] = None,
-        __request__: Request = None,
-    ) -> dict:
-        """
-        Executed after the LLM response is complete.
-        Calculates Token count in the background and triggers summary generation (does not block current response, does not affect content output).
-        """
-        # Check if compression should be skipped (e.g., for copilot_sdk)
-        if self._should_skip_compression(body, __model__):
-            if self.valves.debug_mode:
-                logger.info(
-                    "[Outlet] Skipping compression: copilot_sdk detected in base model"
-                )
-            if self.valves.show_debug_log and __event_call__:
-                await self._log(
-                    "[Outlet] ⏭️ Skipping compression: copilot_sdk detected",
-                    event_call=__event_call__,
-                )
-            return body
-
-        # Get user context for i18n
-        user_ctx = await self._get_user_context(__user__, __event_call__)
-        lang = user_ctx["user_language"]
-
-        chat_ctx = self._get_chat_context(body, __metadata__)
-        chat_id = chat_ctx["chat_id"]
-        if not chat_id:
-            await self._log(
-                "[Outlet] ❌ Missing chat_id in metadata, skipping compression",
-                log_type="error",
-                event_call=__event_call__,
-            )
-            return body
-        model = body.get("model") or ""
-        messages = body.get("messages", [])
-
-        # Unfold compact tool messages to align with inlet's exact coordinate system.
-        # Native tool-calling payloads in outlet can miss hidden `output` fields, so
-        # preserve the older DB fallback there only.
-        function_calling_mode = self._get_function_calling_mode(body)
-        if function_calling_mode == "native":
-            db_messages = await self._load_full_chat_messages(chat_id)
-            messages_to_unfold = (
-                db_messages
-                if (db_messages and len(db_messages) >= len(messages))
-                else messages
-            )
-            summary_messages = self._unfold_messages(messages_to_unfold)
-            if messages_to_unfold is db_messages:
-                message_source = (
-                    "outlet-db-unfolded"
-                    if len(summary_messages) != len(db_messages)
-                    else "outlet-db"
-                )
-            else:
-                message_source = (
-                    "outlet-body-unfolded"
-                    if len(summary_messages) != len(messages)
-                    else "outlet-body"
-                )
-        else:
-            summary_messages = self._unfold_messages(messages)
-            message_source = (
-                "outlet-body-unfolded"
-                if len(summary_messages) != len(messages)
-                else "outlet-body"
-            )
-
-        restored_count_before = len(summary_messages)
-        summary_messages = self._restore_pending_inlet_messages(
-            chat_id, summary_messages
-        )
-        if len(summary_messages) != restored_count_before:
-            message_source = f"{message_source}+pending"
-
-        # Calculate target compression progress directly, then align it to an atomic
-        # boundary so the saved summary never cuts through a tool-calling block.
-        target_compressed_count = self._calculate_target_compressed_count(
-            summary_messages
-        )
-
-        summary_body = dict(body)
-        summary_body["messages"] = summary_messages
-
-        # Process Token calculation and summary generation asynchronously in the background
-        # Use a lock to prevent multiple concurrent summary tasks for the same chat
-        chat_lock = self._get_chat_lock(chat_id)
-
-        if chat_lock.locked():
-            if self.valves.debug_mode:
-                logger.info(
-                    f"[Outlet] Skipping summary task for {chat_id}: Task already in progress"
-                )
-            return body
-
-        asyncio.create_task(
-            self._locked_summary_task(
-                chat_lock,
-                chat_id,
-                model,
-                summary_body,
-                __user__,
-                target_compressed_count,
-                lang,
-                __event_emitter__,
-                __event_call__,
-                __request__,
-            )
-        )
-
-        return body
 
     async def _locked_summary_task(
         self,
@@ -3134,6 +1779,15 @@ class Filter:
                     }
                 )
             logger.exception("[🔍 Background Calculation] Unhandled exception")
+
+# ── summarize.py · Summary prompt building + LLM call ─────────────────
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
+
+
+class SummarizeMixin:
+
+    """Summary prompt building + LLM call."""
 
     def _clean_model_id(self, model_id: Optional[str]) -> Optional[str]:
         """Cleans the model ID by removing whitespace and quotes."""
@@ -3932,3 +2586,1418 @@ Return only the XML working memory:
             wrapped_error = Exception(error_message)
             setattr(wrapped_error, "_frontend_logged", True)
             raise wrapped_error
+
+# ── externalrefs.py · Cross-chat reference loading/injection ──────────
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
+
+
+class ExternalRefsMixin:
+
+    """Cross-chat reference loading/injection."""
+
+    async def _handle_external_chat_references(
+        self,
+        body: dict,
+        user_data: Optional[dict] = None,
+        __event_call__: Callable = None,
+        __request__: Request = None,
+    ) -> dict:
+        metadata = body.get("metadata", {})
+        files = metadata.get("files", [])
+
+        if not files:
+            return body
+
+        chat_files = [f for f in files if f.get("type") == "chat"]
+        if not chat_files:
+            return body
+
+        if __event_call__:
+            await self._log(
+                f"[Inlet] 📎 Found {len(chat_files)} external chat reference(s)",
+                event_call=__event_call__,
+            )
+
+        model_id = self._clean_model_id(body.get("model"))
+        thresholds = self._get_model_thresholds(model_id) or {}
+        max_context_tokens = thresholds.get(
+            "max_context_tokens", self.valves.max_context_tokens
+        )
+        max_summary_tokens = self.valves.max_summary_tokens or 4096
+        summary_model = (
+            self._clean_model_id(self.valves.summary_model)
+            or self._clean_model_id(body.get("model"))
+            or "gpt-4o-mini"
+        )
+        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
+
+        base_messages = body.get("messages", [])
+        base_message_tokens = self._estimate_messages_tokens(base_messages)
+        remaining_direct_budget = (
+            max(0, max_context_tokens - base_message_tokens)
+            if max_context_tokens and max_context_tokens > 0
+            else max_summary_tokens
+        )
+
+        referenced_summaries = []
+        for chat_file in chat_files:
+            ref_chat_id = chat_file.get("id")
+            if isinstance(ref_chat_id, str):
+                ref_chat_title = chat_file.get("name", f"Chat {ref_chat_id[:8]}...")
+            else:
+                ref_chat_title = chat_file.get("name", "Unknown Chat")
+
+            if not ref_chat_id:
+                continue
+
+            summary_record = await self._load_summary_record(ref_chat_id)
+
+            if summary_record and summary_record.summary:
+                remaining_direct_budget = max(
+                    0,
+                    remaining_direct_budget
+                    - _estimate_text_tokens(summary_record.summary),
+                )
+                referenced_summaries.append(
+                    {
+                        "chat_id": ref_chat_id,
+                        "title": ref_chat_title,
+                        "summary": summary_record.summary,
+                        "type": "existing",
+                    }
+                )
+                if __event_call__:
+                    await self._log(
+                        f"[Inlet] ✅ Found existing summary for referenced chat '{ref_chat_title}' ({len(summary_record.summary)} chars)",
+                        event_call=__event_call__,
+                    )
+            else:
+                chat_messages = await self._load_full_chat_messages(ref_chat_id)
+                if not chat_messages:
+                    if __event_call__:
+                        await self._log(
+                            f"[Inlet] ⚠️ No messages found for '{ref_chat_title}', skipping",
+                            event_call=__event_call__,
+                        )
+                    continue
+
+                conversation_text = self._format_messages_for_summary(chat_messages)
+                estimated_tokens = _estimate_text_tokens(conversation_text)
+                inject_full_chat = estimated_tokens <= max(0, remaining_direct_budget)
+
+                if inject_full_chat:
+                    referenced_summaries.append(
+                        {
+                            "chat_id": ref_chat_id,
+                            "title": ref_chat_title,
+                            "summary": conversation_text,
+                            "type": "full",
+                        }
+                    )
+                    remaining_direct_budget = max(
+                        0, remaining_direct_budget - estimated_tokens
+                    )
+                    if __event_call__:
+                        await self._log(
+                            f"[Inlet] 📄 Chat '{ref_chat_title}' fits current model budget ({estimated_tokens} tokens), injecting full content",
+                            event_call=__event_call__,
+                        )
+                else:
+                    summary_input_text = conversation_text
+                    covered_message_count = len(chat_messages)
+                    covers_full_history = True
+
+                    if (
+                        summary_model_max_context > 0
+                        and estimated_tokens > summary_model_max_context
+                    ):
+                        summary_input_text = self._truncate_messages_for_summary(
+                            chat_messages, summary_model_max_context
+                        )
+                        truncated_tokens = _estimate_text_tokens(summary_input_text)
+                        covered_message_count = 0
+                        covers_full_history = False
+                        if __event_call__:
+                            await self._log(
+                                f"[Inlet] ✂️ Chat '{ref_chat_title}' exceeds summary input budget, truncating recent window from {estimated_tokens} to {truncated_tokens} tokens before summarization",
+                                event_call=__event_call__,
+                            )
+
+                    summary = ""
+                    generated_with_llm = False
+
+                    if isinstance(user_data, dict) and user_data.get("id"):
+                        if __event_call__:
+                            await self._log(
+                                f"[Inlet] 🤖 Generating referenced chat summary for '{ref_chat_title}' with model '{summary_model}'",
+                                event_call=__event_call__,
+                            )
+                        try:
+                            summary = await self._call_summary_llm(
+                                summary_input_text,
+                                {"model": summary_model},
+                                user_data,
+                                __event_call__,
+                                __request__,
+                                previous_summary=None,
+                            )
+                            generated_with_llm = bool(summary)
+                        except Exception as exc:
+                            logger.warning(
+                                "[Inlet] Referenced chat summary failed for '%s': %s",
+                                ref_chat_title,
+                                exc,
+                            )
+                            if __event_call__:
+                                await self._log(
+                                    f"[Inlet] ⚠️ Referenced chat summary failed for '{ref_chat_title}', falling back to direct contextual injection: {exc}",
+                                    log_type="warning",
+                                    event_call=__event_call__,
+                                )
+                    else:
+                        if __event_call__:
+                            await self._log(
+                                f"[Inlet] ⚠️ Missing user context for '{ref_chat_title}', falling back to direct contextual injection without LLM summary",
+                                event_call=__event_call__,
+                            )
+
+                    if not summary:
+                        summary = summary_input_text
+                        if __event_call__:
+                            await self._log(
+                                f"[Inlet] 📎 Falling back to direct contextual injection for '{ref_chat_title}'",
+                                event_call=__event_call__,
+                            )
+
+                    summary_estimate = _estimate_text_tokens(summary)
+                    if summary_estimate > max_summary_tokens:
+                        target_chars = max(
+                            1, int(len(summary) * max_summary_tokens / summary_estimate)
+                        )
+                        summary = summary[:target_chars]
+                        if __event_call__:
+                            await self._log(
+                                f"[Inlet] ✂️ Trimmed injected context for '{ref_chat_title}' to stay near {max_summary_tokens} tokens",
+                                event_call=__event_call__,
+                            )
+                        summary_estimate = _estimate_text_tokens(summary)
+
+                    remaining_direct_budget = max(
+                        0, remaining_direct_budget - summary_estimate
+                    )
+
+                    referenced_summaries.append(
+                        {
+                            "chat_id": ref_chat_id,
+                            "title": ref_chat_title,
+                            "summary": summary,
+                            "type": (
+                                "generated_summary"
+                                if generated_with_llm
+                                else "direct_fallback"
+                            ),
+                        }
+                    )
+
+                    if (
+                        generated_with_llm
+                        and covers_full_history
+                        and covered_message_count > 0
+                    ):
+                        await self._save_summary(
+                            ref_chat_id,
+                            summary,
+                            covered_message_count,
+                        )
+                        if __event_call__:
+                            await self._log(
+                                f"[Inlet] 💾 Saved summary cache for '{ref_chat_title}'",
+                                event_call=__event_call__,
+                            )
+
+        if not referenced_summaries:
+            return body
+
+        summary_parts = []
+        for ref in referenced_summaries:
+            summary_parts.append(
+                f'<referenced_chat id="{ref["chat_id"]}" name="{ref["title"]}">\n{ref["summary"]}\n</referenced_chat>'
+            )
+
+        if summary_parts:
+            ref_context = "\n\n".join(summary_parts)
+            ref_content = f"<referenced_chats>\n{ref_context}\n</referenced_chats>"
+
+            body["__external_references__"] = {
+                "content": ref_content,
+                "references": [
+                    {"chat_id": ref["chat_id"], "title": ref["title"]}
+                    for ref in referenced_summaries
+                ],
+            }
+
+            if __event_call__:
+                await self._log(
+                    f"[Inlet] 💉 Prepared {len(referenced_summaries)} referenced chat context block(s) for injection",
+                    event_call=__event_call__,
+                )
+
+        return body
+
+    async def _generate_referenced_summaries_background(
+        self,
+        referenced_chats: List[Dict[str, Any]],
+        user_data: Optional[dict] = None,
+        __request__: Request = None,
+        __event_call__: Callable = None,
+    ) -> List[Dict[str, Any]]:
+        """Generate cacheable summaries for referenced chats when enough context is available."""
+        if not referenced_chats:
+            return []
+
+        generated_summaries = []
+        summary_model = self._clean_model_id(self.valves.summary_model) or "gpt-4o-mini"
+        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
+
+        for referenced_chat in referenced_chats:
+            if not isinstance(referenced_chat, dict):
+                continue
+
+            ref_chat_id = referenced_chat.get("chat_id")
+            ref_chat_title = referenced_chat.get("title", "Unknown Chat")
+            if not ref_chat_id:
+                continue
+
+            summary_input_text = referenced_chat.get("conversation_text", "")
+            covers_full_history = bool(referenced_chat.get("covers_full_history", True))
+            covered_message_count = int(
+                referenced_chat.get("covered_message_count", 0) or 0
+            )
+
+            if (
+                not isinstance(summary_input_text, str)
+                or not summary_input_text.strip()
+            ):
+                chat_messages = await self._load_full_chat_messages(ref_chat_id)
+                if not chat_messages:
+                    continue
+                summary_input_text = self._format_messages_for_summary(chat_messages)
+                covers_full_history = True
+                covered_message_count = len(chat_messages)
+
+            estimated_tokens = _estimate_text_tokens(summary_input_text)
+            if (
+                summary_model_max_context > 0
+                and estimated_tokens > summary_model_max_context
+            ):
+                chat_messages = await self._load_full_chat_messages(ref_chat_id)
+                if chat_messages:
+                    summary_input_text = self._truncate_messages_for_summary(
+                        chat_messages, summary_model_max_context
+                    )
+                    covers_full_history = False
+                    covered_message_count = 0
+
+            if not isinstance(user_data, dict) or not user_data.get("id"):
+                continue
+
+            summary = await self._call_summary_llm(
+                summary_input_text,
+                {"model": summary_model},
+                user_data,
+                __event_call__,
+                __request__,
+                previous_summary=None,
+            )
+
+            if not summary:
+                continue
+
+            generated_summaries.append(
+                {
+                    "chat_id": ref_chat_id,
+                    "title": ref_chat_title,
+                    "summary": summary,
+                    "covers_full_history": covers_full_history,
+                    "covered_message_count": covered_message_count,
+                }
+            )
+
+            if covers_full_history and covered_message_count > 0:
+                await self._save_summary(
+                    ref_chat_id,
+                    summary,
+                    covered_message_count,
+                )
+
+        return generated_summaries
+
+# ── console.py · Frontend console logging + status ────────────────────
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
+
+
+class ConsoleMixin:
+
+    """Frontend console logging + status."""
+
+    async def _emit_frontend_console_log(
+        self,
+        message: str,
+        log_type: str = "info",
+        event_call=None,
+        force: bool = False,
+    ):
+        """Emit a browser-console log, optionally bypassing the debug-log valve."""
+        if not event_call:
+            return
+        if not force and not self.valves.show_debug_log:
+            return
+
+        try:
+            css = "color: #3b82f6;"
+            console_method = "log"
+            if log_type == "error":
+                css = "color: #ef4444; font-weight: bold;"
+                console_method = "error"
+            elif log_type == "warning":
+                css = "color: #f59e0b;"
+                console_method = "warn"
+            elif log_type == "success":
+                css = "color: #10b981; font-weight: bold;"
+
+            lines = message.split("\n")
+            filtered_lines = [
+                line
+                for line in lines
+                if not line.strip().startswith("====")
+                and not line.strip().startswith("----")
+            ]
+            clean_message = "\n".join(filtered_lines).strip()
+
+            if not clean_message:
+                return
+
+            message_lines = [
+                line.rstrip() for line in clean_message.split("\n") if line.strip()
+            ]
+            header_line = message_lines[0] if message_lines else clean_message
+            detail_lines = message_lines[1:] if len(message_lines) > 1 else []
+
+            if detail_lines:
+                js_code = f"""
+                    try {{
+                        const header = {json.dumps("[Compression] " + header_line, ensure_ascii=False)};
+                        const detailLines = {json.dumps(detail_lines, ensure_ascii=False)};
+                        console.groupCollapsed("%c" + header, "{css}");
+                        for (const line of detailLines) {{
+                            console.{console_method}(line);
+                        }}
+                        console.groupEnd();
+                        return true;
+                    }} catch (e) {{
+                        console.error("[Compression] Failed to emit console log", e);
+                        return false;
+                    }}
+                """
+            else:
+                js_code = f"""
+                    try {{
+                        console.{console_method}("%c" + {json.dumps("[Compression] " + header_line, ensure_ascii=False)}, "{css}");
+                        return true;
+                    }} catch (e) {{
+                        console.error("[Compression] Failed to emit console log", e);
+                        return false;
+                    }}
+                """
+
+            await asyncio.wait_for(
+                event_call({"type": "execute", "data": {"code": js_code}}),
+                timeout=2.0,
+            )
+        except ValueError as ve:
+            if "broadcast" in str(ve).lower():
+                logger.debug(
+                    "Cannot broadcast to frontend without explicit room; suppressing further frontend logs in this session."
+                )
+                if not force:
+                    self.valves.show_debug_log = False
+            else:
+                logger.error(f"Failed to process log to frontend: ValueError: {ve}")
+        except Exception as e:
+            logger.error(f"Failed to process log to frontend: {type(e).__name__}: {e}")
+
+    async def _log(self, message: str, log_type: str = "info", event_call=None):
+        """Unified logging to both backend (print) and frontend (console.log)"""
+        # Backend logging
+        if self.valves.debug_mode:
+            logger.info(message)
+
+        await self._emit_frontend_console_log(
+            message, log_type=log_type, event_call=event_call
+        )
+
+    def _should_show_status(self, usage_ratio: float) -> bool:
+        """
+        Check if token usage status should be shown based on threshold.
+
+        Args:
+            usage_ratio: Current usage ratio (0.0 to 1.0)
+
+        Returns:
+            True if status should be shown, False otherwise
+        """
+        if not self.valves.show_token_usage_status:
+            return False
+
+        # If threshold is 0, always show
+        if self.valves.token_usage_status_threshold == 0:
+            return True
+
+        # Check if usage exceeds threshold
+        threshold_ratio = self.valves.token_usage_status_threshold / 100.0
+        return usage_ratio >= threshold_ratio
+
+# ── filter.py · Filter entry point (inlet/outlet/Valves) ──────────────
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
+
+class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
+            SummarizeMixin, ExternalRefsMixin, ConsoleMixin):
+    """Open WebUI filter: async context compression (entry point)."""
+    def __init__(self):
+        self.valves = self.Valves()
+        self._owui_db = owui_db
+        self._db_engine = owui_engine
+        self._fallback_session_factory = (
+            sessionmaker(bind=self._db_engine) if self._db_engine else None
+        )
+        self._model_thresholds_cache: Optional[Dict[str, Any]] = None
+
+        # Fallback mapping for variants not in TRANSLATIONS keys
+        self.fallback_map = {
+            "en-CA": "en-US",
+            "en-GB": "en-US",
+            "en-AU": "en-US",
+        }
+
+        # Concurrency control: Lock per chat session
+        self._chat_locks = {}
+        self._pending_inlet_messages: Dict[str, List[Dict[str, Any]]] = {}
+        self._init_database()
+    class Valves(BaseModel):
+        priority: int = Field(
+            default=10, description="Priority level for the filter operations."
+        )
+        # Token related parameters
+        compression_threshold_tokens: int = Field(
+            default=64000,
+            ge=0,
+            description="When total context Token count exceeds this value, trigger compression (Global Default)",
+        )
+        max_context_tokens: int = Field(
+            default=128000,
+            ge=0,
+            description="Hard limit for context. Exceeding this value will force removal of earliest messages (Global Default)",
+        )
+        model_thresholds: str = Field(
+            default="",
+            description="Per-model threshold overrides. Format: model_id:compression_threshold:max_context (comma-separated). Example: gpt-4:8000:32000, claude-3:100000:200000",
+        )
+
+        keep_first: int = Field(
+            default=0,
+            ge=0,
+            description="Keep the first N non-system messages plus all interleaved system messages. Set to 0 to disable.",
+        )
+        keep_last: int = Field(
+            default=6, ge=0, description="Always keep the last N full messages."
+        )
+        summary_model: Optional[str] = Field(
+            default=None,
+            description="The model ID used to generate the summary. If empty, uses the current conversation's model. Used to match configurations in model_thresholds.",
+        )
+        summary_model_max_context: int = Field(
+            default=0,
+            ge=0,
+            description="Max context tokens for the summary model. If 0, falls back to model_thresholds or global max_context_tokens. Example: gemini-flash=1000000, gpt-4o-mini=128000.",
+        )
+        max_summary_tokens: int = Field(
+            default=16384,
+            ge=1,
+            description="The maximum number of tokens for the summary.",
+        )
+        summary_temperature: float = Field(
+            default=0.1,
+            ge=0.0,
+            le=2.0,
+            description="The temperature for summary generation.",
+        )
+        debug_mode: bool = Field(
+            default=False, description="Enable detailed logging for debugging."
+        )
+        show_debug_log: bool = Field(
+            default=False, description="Show debug logs in the frontend console"
+        )
+        show_token_usage_status: bool = Field(
+            default=True, description="Show token usage status notification"
+        )
+        token_usage_status_threshold: int = Field(
+            default=80,
+            ge=0,
+            le=100,
+            description="Only show token usage status when usage exceeds this percentage (0-100). Set to 0 to always show.",
+        )
+        enable_tool_output_trimming: bool = Field(
+            default=True,
+            description="Enable trimming of large tool outputs (only works with native function calling).",
+        )
+        tool_trim_threshold_chars: int = Field(
+            default=600,
+            ge=1,
+            description="Trim native tool outputs when their total content length reaches this many characters.",
+        )
+    async def inlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: dict = None,
+        __request__: Request = None,
+        __model__: dict = None,
+        __event_emitter__: Callable[[Any], Awaitable[None]] = None,
+        __event_call__: Callable[[Any], Awaitable[None]] = None,
+    ) -> dict:
+        """
+        Executed before sending to the LLM.
+        Compression Strategy: Only responsible for injecting existing summaries, no Token calculation.
+        """
+
+        if self._should_skip_compression(body, __model__):
+            if self.valves.debug_mode:
+                logger.info(
+                    "[Inlet] Skipping compression: copilot_sdk detected in base model"
+                )
+            return body
+
+        messages = body.get("messages", [])
+        user_ctx = await self._get_user_context(__user__, __event_call__)
+        lang = user_ctx["user_language"]
+
+        normalized_tool_call_count = self._normalize_native_tool_call_ids(messages)
+        if (
+            normalized_tool_call_count > 0
+            and self.valves.show_debug_log
+            and __event_call__
+        ):
+            await self._log(
+                f"[Inlet] 🪪 Normalized {normalized_tool_call_count} overlong tool call ID(s).",
+                event_call=__event_call__,
+            )
+
+        # --- Native Tool Output Trimming (Opt-in, only for native function calling) ---
+        function_calling_mode = self._get_function_calling_mode(body)
+        is_native_func_calling = function_calling_mode == "native"
+
+        if self.valves.show_debug_log and __event_call__:
+            trimming_state = (
+                "enabled" if self.valves.enable_tool_output_trimming else "disabled"
+            )
+            await self._log(
+                "[Inlet] ✂️ Tool trimming check: "
+                f"state={trimming_state}, function_calling={function_calling_mode or 'unset'}, "
+                f"message_count={len(messages)}",
+                event_call=__event_call__,
+            )
+
+        if self.valves.enable_tool_output_trimming and is_native_func_calling:
+            trimmed_count, trim_debug = self._trim_native_tool_outputs(
+                messages,
+                lang,
+                collect_debug=bool(self.valves.show_debug_log and __event_call__),
+            )
+        elif self.valves.show_debug_log and __event_call__:
+            skip_reason = (
+                "tool trimming disabled"
+                if not self.valves.enable_tool_output_trimming
+                else f"function_calling={function_calling_mode or 'unset'}"
+            )
+            await self._log(
+                f"[Inlet] ✂️ Tool trimming skipped: {skip_reason}.",
+                event_call=__event_call__,
+            )
+
+        chat_ctx = self._get_chat_context(body, __metadata__)
+        chat_id = chat_ctx["chat_id"]
+
+        body = await self._handle_external_chat_references(
+            body,
+            user_data=__user__,
+            __event_call__=__event_call__,
+            __request__=__request__,
+        )
+        messages = body.get("messages", [])
+
+        # Extract system prompt for accurate token calculation
+        # 1. For custom models: check DB (Models.get_model_by_id)
+        # 2. For base models: check messages for role='system'
+        system_prompt_content = None
+
+        # Try to get from DB (custom model)
+        # Try to get from DB (custom model)
+        try:
+            model_id = body.get("model")
+            if model_id:
+                if self.valves.show_debug_log and __event_call__:
+                    await self._log(
+                        f"[Inlet] 🔍 Attempting DB lookup for model: {model_id}",
+                        event_call=__event_call__,
+                    )
+
+                # Clean model ID if needed (though get_model_by_id usually expects the full ID)
+                # Version-aware DB call (async on >=0.9.0, sync on <0.9.0)
+                model_obj = await _call_db(Models.get_model_by_id, model_id)
+
+                if model_obj:
+                    if self.valves.show_debug_log and __event_call__:
+                        await self._log(
+                            f"[Inlet] ✅ Model found in DB: {model_obj.name} (ID: {model_obj.id})",
+                            event_call=__event_call__,
+                        )
+
+                    if model_obj.params:
+                        try:
+                            params = model_obj.params
+                            # Handle case where params is a JSON string
+                            if isinstance(params, str):
+                                params = json.loads(params)
+                            # Convert Pydantic model to dict if needed
+                            elif hasattr(params, "model_dump"):
+                                params = params.model_dump()
+                            elif hasattr(params, "dict"):
+                                params = params.dict()
+
+                            # Now params should be a dict
+                            if isinstance(params, dict):
+                                system_prompt_content = params.get("system")
+                            else:
+                                # Fallback: try getattr
+                                system_prompt_content = getattr(params, "system", None)
+
+                            if system_prompt_content:
+                                if self.valves.show_debug_log and __event_call__:
+                                    await self._log(
+                                        f"[Inlet] 📝 System prompt found in DB params ({len(system_prompt_content)} chars)",
+                                        event_call=__event_call__,
+                                    )
+                            else:
+                                if self.valves.show_debug_log and __event_call__:
+                                    await self._log(
+                                        f"[Inlet] ⚠️ 'system' key missing in model params",
+                                        event_call=__event_call__,
+                                    )
+                        except Exception as e:
+                            if self.valves.show_debug_log and __event_call__:
+                                await self._log(
+                                    f"[Inlet] ❌ Failed to parse model params: {e}",
+                                    log_type="error",
+                                    event_call=__event_call__,
+                                )
+
+                    else:
+                        if self.valves.show_debug_log and __event_call__:
+                            await self._log(
+                                f"[Inlet] ⚠️ Model params are empty",
+                                event_call=__event_call__,
+                            )
+                else:
+                    if self.valves.show_debug_log and __event_call__:
+                        await self._log(
+                            f"[Inlet] ℹ️ Not a custom model, skipping custom system prompt check",
+                            event_call=__event_call__,
+                        )
+
+        except Exception as e:
+            if self.valves.show_debug_log and __event_call__:
+                await self._log(
+                    f"[Inlet] ❌ Error fetching system prompt from DB: {e}",
+                    log_type="error",
+                    event_call=__event_call__,
+                )
+            if self.valves.debug_mode:
+                logger.error(f"[Inlet] Error fetching system prompt from DB: {e}")
+
+        # Fall back to checking messages (base model or already included)
+        if not system_prompt_content:
+            for msg in messages:
+                if msg.get("role") == "system":
+                    system_prompt_content = msg.get("content", "")
+                    break
+
+        # Build system_prompt_msg for token calculation
+        system_prompt_msg = None
+        if system_prompt_content:
+            system_prompt_msg = {"role": "system", "content": system_prompt_content}
+            if self.valves.debug_mode:
+                logger.info(
+                    f"[Inlet] Found system prompt ({len(system_prompt_content)} chars). Including in budget."
+                )
+
+        # Log message statistics (Moved here to include extracted system prompt)
+        if self.valves.show_debug_log and __event_call__:
+            try:
+                msg_stats = {
+                    "user": 0,
+                    "assistant": 0,
+                    "system": 0,
+                    "total": len(messages),
+                }
+                for msg in messages:
+                    role = msg.get("role", "unknown")
+                    if role in msg_stats:
+                        msg_stats[role] += 1
+
+                # If system prompt was extracted from DB/Model but not in messages, count it
+                if system_prompt_content:
+                    # Check if it's already counted (i.e., was in messages)
+                    is_in_messages = any(m.get("role") == "system" for m in messages)
+                    if not is_in_messages:
+                        msg_stats["system"] += 1
+                        msg_stats["total"] += 1
+
+                stats_str = f"Total: {msg_stats['total']} | User: {msg_stats['user']} | Assistant: {msg_stats['assistant']} | System: {msg_stats['system']}"
+                await self._log(
+                    f"[Inlet] Message Stats: {stats_str}", event_call=__event_call__
+                )
+            except Exception as e:
+                logger.error(f"[Inlet] Error logging message stats: {e}")
+
+        if not chat_id:
+            await self._log(
+                "[Inlet] ❌ Missing chat_id in metadata, skipping compression",
+                log_type="error",
+                event_call=__event_call__,
+            )
+            return body
+
+        if self.valves.debug_mode or self.valves.show_debug_log:
+            await self._log(
+                f"\n{'='*60}\n[Inlet] Chat ID: {chat_id}\n[Inlet] Received {len(messages)} messages",
+                event_call=__event_call__,
+            )
+
+            # Log custom model configurations
+            raw_config = self.valves.model_thresholds
+            parsed_configs = self._parse_model_thresholds()
+
+            if raw_config:
+                config_list = [
+                    f"{model}: {cfg['compression_threshold_tokens']}t/{cfg['max_context_tokens']}t"
+                    for model, cfg in parsed_configs.items()
+                ]
+
+                if config_list:
+                    await self._log(
+                        f"[Inlet] 📋 Model Configs (Raw: '{raw_config}'): {', '.join(config_list)}",
+                        event_call=__event_call__,
+                    )
+                else:
+                    await self._log(
+                        f"[Inlet] ⚠️ Invalid Model Configs (Raw: '{raw_config}'): No valid configs parsed. Expected format: 'model_id:threshold:max_context'",
+                        log_type="warning",
+                        event_call=__event_call__,
+                    )
+            else:
+                await self._log(
+                    f"[Inlet] 📋 Model Configs: No custom configuration (Global defaults only)",
+                    event_call=__event_call__,
+                )
+
+        # Log the aligned compression boundary using the same original-history
+        # coordinate mapping as outlet/async summary generation.
+        target_compressed_count = self._calculate_target_compressed_count(messages)
+
+        await self._log(
+            f"[Inlet] Recorded target compression progress: {target_compressed_count}",
+            event_call=__event_call__,
+        )
+
+        # Load summary record
+        summary_record = await self._load_summary_record(chat_id)
+
+        # Calculate effective_keep_first to ensure all system messages are protected
+        effective_keep_first = self._get_effective_keep_first(messages)
+
+        final_messages = []
+        external_refs_injected_count = 0
+
+        if summary_record:
+            # Summary exists, build view: [Head] + [Summary Message] + [Tail]
+            # Tail is all messages after the last compression point
+            compressed_count = summary_record.compressed_message_count
+
+            # Ensure compressed_count is reasonable
+            if compressed_count > len(messages):
+                compressed_count = max(0, len(messages) - self.valves.keep_last)
+
+            # 1. Head messages (Keep First)
+            head_messages = []
+            if effective_keep_first > 0:
+                head_messages = messages[:effective_keep_first]
+
+            # 2. Tail messages (Tail) - All messages starting from the last compression point.
+            # Align legacy/raw progress to an atomic boundary so old summary rows do not
+            # reintroduce orphaned tool messages into the retained tail.
+            raw_start_index = max(compressed_count, effective_keep_first)
+            start_index = self._align_tail_start_to_atomic_boundary(
+                messages, raw_start_index, effective_keep_first
+            )
+
+            # --- Extract Preserved System Messages from the Gap ---
+            # Any system message in the gap (messages[effective_keep_first:start_index])
+            # must be preserved according to policy.
+            gap_messages = messages[effective_keep_first:start_index]
+            preserved_system_messages = [
+                msg
+                for msg in gap_messages
+                if isinstance(msg, dict) and msg.get("role") == "system"
+            ]
+
+            # 3. Summary message (Inserted as Assistant message)
+            external_refs = body.pop("__external_references__", None)
+            summary_msg = self._build_summary_message(
+                summary_record.summary,
+                lang,
+                start_index,
+            )
+
+            if external_refs:
+                external_content = external_refs.get("content", "")
+                if external_content:
+                    external_refs_injected_count = len(
+                        external_refs.get("references", [])
+                    )
+                    summary_msg["content"] = (
+                        f"<external_references>\n{external_content}\n</external_references>\n\n"
+                        + summary_msg["content"]
+                    )
+                    summary_msg["metadata"]["external_references"] = external_refs.get(
+                        "references", []
+                    )
+
+            tail_messages = messages[start_index:]
+
+            # --- Preflight Check & Budgeting (Simplified) ---
+
+            # Assemble candidate messages (for output)
+            candidate_messages = (
+                head_messages
+                + [summary_msg]
+                + preserved_system_messages
+                + tail_messages
+            )
+
+            # Prepare messages for token calculation (include system prompt if missing)
+            calc_messages = candidate_messages
+            if system_prompt_msg:
+                # Check if system prompt is already in head_messages
+                is_in_head = any(m.get("role") == "system" for m in head_messages)
+                if not is_in_head:
+                    calc_messages = [system_prompt_msg] + candidate_messages
+
+            # Get max context limit
+            model = self._clean_model_id(body.get("model"))
+            thresholds = self._get_model_thresholds(model)
+            max_context_tokens = thresholds.get(
+                "max_context_tokens", self.valves.max_context_tokens
+            )
+
+            # --- Fast Estimation Check ---
+            estimated_tokens = self._estimate_messages_tokens(calc_messages)
+
+            # Since this is a hard limit check, only skip precise calculation if we are far below it (margin of 15%)
+            # max_context_tokens == 0 means "no limit", skip reduction entirely
+            if max_context_tokens <= 0:
+                total_tokens = estimated_tokens
+                await self._log(
+                    f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
+                    event_call=__event_call__,
+                )
+            elif estimated_tokens < max_context_tokens * 0.85:
+                total_tokens = estimated_tokens
+                await self._log(
+                    "[Inlet] 🔎 Sent-context preflight (estimated)\n"
+                    f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | status=well_within_limit",
+                    event_call=__event_call__,
+                )
+            else:
+                # Calculate exact total tokens via tiktoken
+                total_tokens = await asyncio.to_thread(
+                    self._calculate_messages_tokens, calc_messages
+                )
+
+                # Preflight Check Log
+                await self._log(
+                    "[Inlet] 🔎 Sent-context preflight (precise)\n"
+                    f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | usage={(total_tokens/max_context_tokens*100):.1f}%",
+                    event_call=__event_call__,
+                )
+
+                # Identify atomic groups to avoid breaking tool-calling context
+                atomic_groups = self._get_atomic_groups(tail_messages)
+
+                while total_tokens > max_context_tokens and len(atomic_groups) > 1:
+                    # Strategy 1: Structure-Aware Assistant Trimming (Optional, only for non-tool messages)
+                    # For simplicity and reliability in this fix, we prioritize Group-Drop over partial trim
+                    # if a group contains tool calls.
+
+                    # Strategy 2: Drop Oldest Atomic Group Entirely
+                    dropped_group_indices = atomic_groups.pop(0)
+                    # Note: indices in dropped_group_indices are relative to ORIGINAL tail_messages
+                    # But since we are popping from tail_messages itself, we need to be careful.
+
+                    # Extract and drop messages in this group from the actual list
+                    # Since we always pop group 0, we pop len(dropped_group_indices) times from front
+                    dropped_tokens = 0
+                    for _ in range(len(dropped_group_indices)):
+                        dropped = tail_messages.pop(0)
+                        if total_tokens == estimated_tokens:
+                            dropped_tokens += self._estimate_content_tokens(
+                                dropped.get("content", "")
+                            )
+                        else:
+                            dropped_tokens += self._count_tokens(
+                                str(dropped.get("content", ""))
+                            )
+
+                    total_tokens -= dropped_tokens
+
+                    if self.valves.show_debug_log and __event_call__:
+                        await self._log(
+                            f"[Inlet] 🗑️ Dropped atomic group ({len(dropped_group_indices)} msgs) to fit context. Tokens: {dropped_tokens}",
+                            event_call=__event_call__,
+                        )
+
+                # Re-assemble
+                candidate_messages = (
+                    head_messages
+                    + [summary_msg]
+                    + preserved_system_messages
+                    + tail_messages
+                )
+
+                await self._log(
+                    "[Inlet] ✂️ Sent-context history reduced\n"
+                    f"sent_context_tokens={total_tokens} | tail_size={len(tail_messages)}",
+                    event_call=__event_call__,
+                )
+
+            final_messages = candidate_messages
+
+            # Calculate detailed token stats for logging
+            summary_content = summary_msg.get("content", "")
+            if total_tokens == estimated_tokens:
+                system_tokens = (
+                    self._estimate_content_tokens(system_prompt_msg.get("content", ""))
+                    if system_prompt_msg
+                    else 0
+                )
+                head_tokens = self._estimate_messages_tokens(head_messages)
+                summary_tokens = self._estimate_content_tokens(summary_content)
+                preserved_system_tokens = self._estimate_messages_tokens(
+                    preserved_system_messages
+                )
+                tail_tokens = self._estimate_messages_tokens(tail_messages)
+            else:
+                system_tokens = (
+                    self._count_tokens(system_prompt_msg.get("content", ""))
+                    if system_prompt_msg
+                    else 0
+                )
+                head_tokens = self._calculate_messages_tokens(head_messages)
+                summary_tokens = self._count_tokens(summary_content)
+                preserved_system_tokens = self._calculate_messages_tokens(
+                    preserved_system_messages
+                )
+                tail_tokens = self._calculate_messages_tokens(tail_messages)
+
+            system_info = (
+                f"System({system_tokens + preserved_system_tokens}t)"
+                if (system_prompt_msg or preserved_system_messages)
+                else "System(0t)"
+            )
+
+            total_section_tokens = (
+                system_tokens
+                + head_tokens
+                + summary_tokens
+                + preserved_system_tokens
+                + tail_tokens
+            )
+
+            await self._log(
+                "[Inlet] ✅ Sent context assembled\n"
+                f"sent_context_tokens={total_section_tokens} | {system_info} + Head({len(head_messages)} msg, {head_tokens}t) + Summary({summary_tokens}t) + Tail({len(tail_messages)} msg, {tail_tokens}t)",
+                log_type="success",
+                event_call=__event_call__,
+            )
+
+            # Prepare status message (Context Usage format)
+            if max_context_tokens > 0:
+                usage_ratio = total_section_tokens / max_context_tokens
+                # Only show status if threshold is met
+                if self._should_show_status(usage_ratio):
+                    status_msg = self._get_translation(
+                        lang,
+                        "status_context_usage",
+                        tokens=total_section_tokens,
+                        max_tokens=max_context_tokens,
+                        ratio=f"{usage_ratio*100:.1f}",
+                    )
+                    if usage_ratio > 0.9:
+                        status_msg += self._get_translation(lang, "status_high_usage")
+
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": status_msg,
+                                    "done": True,
+                                },
+                            }
+                        )
+            else:
+                # For the case where max_context_tokens is 0, show summary info without threshold check
+                if self.valves.show_token_usage_status and __event_emitter__:
+                    status_msg = self._get_translation(
+                        lang, "status_loaded_summary", count=compressed_count
+                    )
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": status_msg,
+                                "done": True,
+                            },
+                        }
+                    )
+
+        else:
+            external_refs = body.pop("__external_references__", None)
+
+            if external_refs and external_refs.get("content") and messages:
+                external_content = external_refs.get("content", "")
+                external_refs_injected_count = len(external_refs.get("references", []))
+                ref_msg = {
+                    "role": "assistant",
+                    "content": (
+                        f"<external_references>\n{external_content}\n</external_references>\n\n"
+                        + "Here are references to other conversations that may be relevant to this discussion."
+                    ),
+                    "metadata": {
+                        "is_summary": True,
+                        "is_external_references": True,
+                        "source": "external_references",
+                        "covered_until": effective_keep_first,
+                        "external_references": external_refs.get("references", []),
+                    },
+                }
+
+                head_messages = messages[:effective_keep_first]
+                tail_messages = messages[effective_keep_first:]
+                candidate_messages = head_messages + [ref_msg] + tail_messages
+
+                if __event_call__:
+                    await self._log(
+                        f"[Inlet] 📎 💉 Injected {external_refs_injected_count} external chat reference(s) as contextual block (head: {len(head_messages)}, tail: {len(tail_messages)})",
+                        event_call=__event_call__,
+                    )
+            else:
+                candidate_messages = messages if messages else []
+
+            if not candidate_messages:
+                return body
+
+            final_messages = candidate_messages
+
+            calc_messages = candidate_messages
+            if system_prompt_msg:
+                is_in_messages = any(
+                    m.get("role") == "system" for m in candidate_messages
+                )
+                if not is_in_messages:
+                    calc_messages = [system_prompt_msg] + candidate_messages
+
+            # Get max context limit
+            model = self._clean_model_id(body.get("model"))
+            thresholds = self._get_model_thresholds(model) or {}
+            max_context_tokens = thresholds.get(
+                "max_context_tokens", self.valves.max_context_tokens
+            )
+
+            # --- Fast Estimation Check ---
+            estimated_tokens = self._estimate_messages_tokens(calc_messages)
+
+            # Only skip precise calculation if we are clearly below the limit
+            # max_context_tokens == 0 means "no limit", skip reduction entirely
+            if max_context_tokens <= 0:
+                total_tokens = estimated_tokens
+                await self._log(
+                    f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
+                    event_call=__event_call__,
+                )
+            elif estimated_tokens < max_context_tokens * 0.85:
+                total_tokens = estimated_tokens
+                await self._log(
+                    f"[Inlet] 🔎 Fast limit check (Est): {total_tokens}t / {max_context_tokens}t",
+                    event_call=__event_call__,
+                )
+            else:
+                total_tokens = await asyncio.to_thread(
+                    self._calculate_messages_tokens, calc_messages
+                )
+
+            if total_tokens > max_context_tokens and max_context_tokens > 0:
+                await self._log(
+                    f"[Inlet] ⚠️ Original messages ({total_tokens} Tokens) exceed limit ({max_context_tokens}). Reducing history...",
+                    log_type="warning",
+                    event_call=__event_call__,
+                )
+
+                # Use atomic grouping to preserve tool-calling integrity
+                trimmable = candidate_messages[effective_keep_first:]
+                atomic_groups = self._get_atomic_groups(trimmable)
+
+                # To follow policy "system messages never lost", we maintain a list of
+                # system messages that were part of dropped groups.
+                dropped_but_preserved_systems = []
+
+                while total_tokens > max_context_tokens and len(atomic_groups) > 1:
+                    dropped_group_indices = atomic_groups.pop(0)
+                    dropped_tokens = 0
+                    for _ in range(len(dropped_group_indices)):
+                        dropped = trimmable.pop(0)
+
+                        # Absolute protections:
+                        # 1. External references (often large and specialized)
+                        # 2. System messages (instructions)
+                        if self._is_external_reference_message(dropped):
+                            trimmable.insert(0, dropped)
+                            # Stop dropping this group if we hit a protected message
+                            # (Though groups should be pure, this is a safety net)
+                            break
+
+                        if (
+                            isinstance(dropped, dict)
+                            and dropped.get("role") == "system"
+                        ):
+                            dropped_but_preserved_systems.append(dropped)
+                            # Even if preserved, it counts as "dropped" from the trimmable flow
+                            # to avoid infinite loop, but its tokens remain in the budget.
+                            # We don't subtract its tokens here.
+                            continue
+
+                        if total_tokens == estimated_tokens:
+                            dropped_tokens += self._estimate_content_tokens(
+                                dropped.get("content", "")
+                            )
+                        else:
+                            dropped_tokens += self._count_tokens(
+                                str(dropped.get("content", ""))
+                            )
+                    total_tokens -= dropped_tokens
+
+                # Re-assemble: [Head] + [Preserved Systems from Dropped Groups] + [Remaining Trimmable/Tail]
+                candidate_messages = (
+                    candidate_messages[:effective_keep_first]
+                    + dropped_but_preserved_systems
+                    + trimmable
+                )
+
+                await self._log(
+                    f"[Inlet] ✂️ Messages reduced (atomic). New total: {total_tokens} Tokens",
+                    event_call=__event_call__,
+                )
+
+            # Send status notification (Context Usage format)
+            if max_context_tokens > 0:
+                usage_ratio = total_tokens / max_context_tokens
+                # Only show status if threshold is met
+                if self._should_show_status(usage_ratio):
+                    status_msg = self._get_translation(
+                        lang,
+                        "status_context_usage",
+                        tokens=total_tokens,
+                        max_tokens=max_context_tokens,
+                        ratio=f"{usage_ratio*100:.1f}",
+                    )
+                    if usage_ratio > 0.9:
+                        status_msg += self._get_translation(lang, "status_high_usage")
+
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": status_msg,
+                                    "done": True,
+                                },
+                            }
+                        )
+
+        body["messages"] = final_messages
+        self._capture_pending_inlet_messages(chat_id, final_messages)
+
+        await self._log(
+            f"[Inlet] ✅ Final send\nsent_message_count={len(body['messages'])}\n{'='*60}\n",
+            event_call=__event_call__,
+        )
+
+        metadata = body.get("metadata", {})
+        files = metadata.get("files", [])
+        if files:
+            new_files = [f for f in files if f.get("type") != "chat"]
+            if len(new_files) != len(files):
+                metadata["files"] = new_files
+                body["metadata"] = metadata
+                if __event_call__:
+                    await self._log(
+                        f"[Inlet] 🗑️ Removed {len(files) - len(new_files)} chat reference(s) from files to prevent RAG",
+                        event_call=__event_call__,
+                    )
+
+        if external_refs_injected_count > 0 and __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": self._get_translation(
+                            lang,
+                            "status_external_refs_injected",
+                            count=external_refs_injected_count,
+                        ),
+                        "done": True,
+                    },
+                }
+            )
+
+        return body
+    async def outlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: dict = None,
+        __model__: dict = None,
+        __event_emitter__: Callable[[Any], Awaitable[None]] = None,
+        __event_call__: Callable[[Any], Awaitable[None]] = None,
+        __request__: Request = None,
+    ) -> dict:
+        """
+        Executed after the LLM response is complete.
+        Calculates Token count in the background and triggers summary generation (does not block current response, does not affect content output).
+        """
+        # Check if compression should be skipped (e.g., for copilot_sdk)
+        if self._should_skip_compression(body, __model__):
+            if self.valves.debug_mode:
+                logger.info(
+                    "[Outlet] Skipping compression: copilot_sdk detected in base model"
+                )
+            if self.valves.show_debug_log and __event_call__:
+                await self._log(
+                    "[Outlet] ⏭️ Skipping compression: copilot_sdk detected",
+                    event_call=__event_call__,
+                )
+            return body
+
+        # Get user context for i18n
+        user_ctx = await self._get_user_context(__user__, __event_call__)
+        lang = user_ctx["user_language"]
+
+        chat_ctx = self._get_chat_context(body, __metadata__)
+        chat_id = chat_ctx["chat_id"]
+        if not chat_id:
+            await self._log(
+                "[Outlet] ❌ Missing chat_id in metadata, skipping compression",
+                log_type="error",
+                event_call=__event_call__,
+            )
+            return body
+        model = body.get("model") or ""
+        messages = body.get("messages", [])
+
+        # Unfold compact tool messages to align with inlet's exact coordinate system.
+        # Native tool-calling payloads in outlet can miss hidden `output` fields, so
+        # preserve the older DB fallback there only.
+        function_calling_mode = self._get_function_calling_mode(body)
+        if function_calling_mode == "native":
+            db_messages = await self._load_full_chat_messages(chat_id)
+            messages_to_unfold = (
+                db_messages
+                if (db_messages and len(db_messages) >= len(messages))
+                else messages
+            )
+            summary_messages = self._unfold_messages(messages_to_unfold)
+            if messages_to_unfold is db_messages:
+                message_source = (
+                    "outlet-db-unfolded"
+                    if len(summary_messages) != len(db_messages)
+                    else "outlet-db"
+                )
+            else:
+                message_source = (
+                    "outlet-body-unfolded"
+                    if len(summary_messages) != len(messages)
+                    else "outlet-body"
+                )
+        else:
+            summary_messages = self._unfold_messages(messages)
+            message_source = (
+                "outlet-body-unfolded"
+                if len(summary_messages) != len(messages)
+                else "outlet-body"
+            )
+
+        restored_count_before = len(summary_messages)
+        summary_messages = self._restore_pending_inlet_messages(
+            chat_id, summary_messages
+        )
+        if len(summary_messages) != restored_count_before:
+            message_source = f"{message_source}+pending"
+
+        # Calculate target compression progress directly, then align it to an atomic
+        # boundary so the saved summary never cuts through a tool-calling block.
+        target_compressed_count = self._calculate_target_compressed_count(
+            summary_messages
+        )
+
+        summary_body = dict(body)
+        summary_body["messages"] = summary_messages
+
+        # Process Token calculation and summary generation asynchronously in the background
+        # Use a lock to prevent multiple concurrent summary tasks for the same chat
+        chat_lock = self._get_chat_lock(chat_id)
+
+        if chat_lock.locked():
+            if self.valves.debug_mode:
+                logger.info(
+                    f"[Outlet] Skipping summary task for {chat_id}: Task already in progress"
+                )
+            return body
+
+        asyncio.create_task(
+            self._locked_summary_task(
+                chat_lock,
+                chat_id,
+                model,
+                summary_body,
+                __user__,
+                target_compressed_count,
+                lang,
+                __event_emitter__,
+                __event_call__,
+                __request__,
+            )
+        )
+
+        return body

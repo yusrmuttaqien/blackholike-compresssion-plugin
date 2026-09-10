@@ -5,7 +5,7 @@ Baseline: `v1.6.1.py` = **4,813 lines**.
 
 **Phase 1 DONE → 3,932 lines (−881, no functional loss).**
 Phase 2: nothing to delete (both features confirmed in use).
-Phase 3 (tidy/split): only if still painful after Phase 1.
+**Phase 3 DONE → split into `src/` modules + `build.py` (verified byte-identical).**
 
 ---
 
@@ -48,14 +48,24 @@ Phase 3 (tidy/split): only if still painful after Phase 1.
 
 ---
 
-## Phase 3 — Tidy (only after cuts, if still painful)
+## Phase 3 — Tidy / split  ✅ DONE
 
-### [ ] 3.1 Split into modules
-- Suggested: `tokens.py`, `db.py`, `compression.py`, `toolcalls.py`, `i18n.py`, `filter.py`.
+### [x] 3.1 Split into modules
+- `src/` fragments: `_header`, `i18n`, `tokens`, `db`, `toolcalls`, `compression`,
+  `summarize`, `externalrefs`, `console`, `filter`.
+- `Filter` split into 8 mixins (one per concern); `filter.py` ties them together
+  (`__init__`, `Valves`, `inlet`, `outlet`).
 
-### [ ] 3.2 Single-file build step (OWUI constraint)
-- Tiny `build.py` that concatenates modules in order, rewrites intra-package imports to nothing, outputs `plugin.py`.
-- **Defer until Phase 1–2 are done** and the remaining size still hurts.
+### [x] 3.2 Single-file build step (OWUI constraint)
+- `build.py` concatenates fragments in dependency order (header first, `Filter` last)
+  → single `v1.6.1.py` for OWUI. Fragments share `_header.py` imports (no per-file
+  imports to rewrite).
+- **Verified:** built file is valid Python; all 67 method bodies byte-identical to
+  the pre-split file; no methods missing/added/duplicated; all module-level
+  constants preserved; clean MRO (mixins inherit `object` directly).
+
+> **Dev workflow:** edit `src/*.py` → `python build.py` → paste `v1.6.1.py` into OWUI.
+> Documented in README → "Development & Building".
 
 ---
 

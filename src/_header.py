@@ -12,7 +12,7 @@ license: MIT
 
 
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List, Union, Callable, Awaitable
+from typing import Optional, Dict, Any, List, Callable, Awaitable
 import re
 import asyncio
 import json

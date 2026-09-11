@@ -141,6 +141,7 @@ class DBMixin:
 
     """DB engine/schema discovery, ChatSummary model, sessions, summary persistence."""
 
+    @contextlib.asynccontextmanager
     async def _async_db_session(self):
         """
         Yield an async-capable database session.
@@ -165,6 +166,7 @@ class DBMixin:
         with self._sync_db_session() as session:
             yield session
 
+    @contextlib.contextmanager
     def _sync_db_session(self):
         """Yield a SYNC database session — reserved for startup/initialization only."""
         db_module = self._owui_db

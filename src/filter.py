@@ -73,6 +73,10 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             le=2.0,
             description="The temperature for summary generation.",
         )
+        summary_chat_template_kwargs: str = Field(
+            default='{"enable_thinking": false}',
+            description="JSON object of chat-template variables sent to the summary model (OpenAI-compatible backends that honor chat_template_kwargs, e.g. vLLM/llama.cpp). Example: {\"enable_thinking\": false} to turn off thinking for Qwen3/Gemma. Leave empty to send none.",
+        )
         debug_mode: bool = Field(
             default=False, description="Enable detailed logging for debugging."
         )

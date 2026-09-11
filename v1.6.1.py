@@ -2438,6 +2438,27 @@ Return only the XML working memory:
 
         return None
 
+    def _get_summary_chat_template_kwargs(self) -> dict:
+        """
+        Parse the summary_chat_template_kwargs valve (a JSON string) into a dict.
+
+        Returns {} when the valve is empty or invalid, so a misconfigured valve
+        degrades to 'no template kwargs' instead of breaking the LLM call.
+        """
+        raw = self.valves.summary_chat_template_kwargs
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning(
+                "summary_chat_template_kwargs is not valid JSON; ignoring: %r", raw
+            )
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     async def _call_summary_llm(
         self,
         new_conversation_text: str,
@@ -2485,6 +2506,12 @@ Return only the XML working memory:
             "max_tokens": max_output_tokens,
             "temperature": self.valves.summary_temperature,
         }
+        # Forward chat-template variables (e.g. {"enable_thinking": false}) so
+        # OpenAI-compatible backends that honor chat_template_kwargs can turn
+        # thinking off for the summary call. Omitted when empty.
+        chat_template_kwargs = self._get_summary_chat_template_kwargs()
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
 
         try:
             # Get user object
@@ -3135,6 +3162,10 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             ge=0.0,
             le=2.0,
             description="The temperature for summary generation.",
+        )
+        summary_chat_template_kwargs: str = Field(
+            default='{"enable_thinking": false}',
+            description="JSON object of chat-template variables sent to the summary model (OpenAI-compatible backends that honor chat_template_kwargs, e.g. vLLM/llama.cpp). Example: {\"enable_thinking\": false} to turn off thinking for Qwen3/Gemma. Leave empty to send none.",
         )
         debug_mode: bool = Field(
             default=False, description="Enable detailed logging for debugging."

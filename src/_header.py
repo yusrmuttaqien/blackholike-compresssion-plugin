@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 SUMMARY_METADATA_SOURCE = "async_context_compression"
 
+# Upper bound on how many chats we remember transient inlet messages for (used by
+# outlet to rebuild the sent context). Prevents unbounded growth across chats.
+PENDING_INLET_MAX_CHATS = 64
+
 # Open WebUI built-in imports
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.models.users import Users
@@ -53,6 +57,18 @@ try:
     import tiktoken
 except ImportError:
     tiktoken = None
+
+# Async HTTP client for provider-side capability probes (llama.cpp /props)
+try:
+    import aiohttp
+except ImportError:  # pragma: no cover - Open WebUI always ships aiohttp
+    aiohttp = None
+
+# Open WebUI >= 0.10 stores connections in the config table; <= 0.9.x uses app.state.config
+try:
+    from open_webui.models.config import Config as OWUIConfig
+except (ModuleNotFoundError, ImportError):  # pragma: no cover - older Open WebUI
+    OWUIConfig = None
 
 # Database imports
 from sqlalchemy import Column, String, Text, DateTime, Integer, inspect

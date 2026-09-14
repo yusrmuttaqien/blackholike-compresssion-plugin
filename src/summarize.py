@@ -114,7 +114,7 @@ class SummarizeMixin:
                 )
                 return
 
-            max_context_tokens = self._get_summary_model_context_limit(summary_model_id)
+            max_context_tokens = await self._get_summary_model_context_limit(summary_model_id)
             request_limits = self._compute_summary_request_limits(max_context_tokens)
 
             await self._log(
@@ -378,11 +378,10 @@ class SummarizeMixin:
                     # 4. Calculate Tokens
                     token_count = self._calculate_messages_tokens(next_context)
 
-                    # 5. Get Thresholds & Calculate Ratio
+                    # 5. Resolve the active model's context window & calculate ratio
                     model = self._clean_model_id(body.get("model"))
-                    thresholds = self._get_model_thresholds(model)
-                    max_context_tokens = thresholds.get(
-                        "max_context_tokens", self.valves.max_context_tokens
+                    max_context_tokens = await self._get_model_max_context(
+                        model, (body.get("metadata") or {}).get("model")
                     )
                     # 6. Emit Status (only if threshold is met)
                     if max_context_tokens > 0:
@@ -710,7 +709,7 @@ Return only the XML working memory:
 
         await self._log(f"[🤖 LLM Call] Model: {model}", event_call=__event_call__)
 
-        max_context_tokens = self._get_summary_model_context_limit(model)
+        max_context_tokens = await self._get_summary_model_context_limit(model)
         request_limits = self._compute_summary_request_limits(max_context_tokens)
         max_output_tokens = request_limits["max_output_tokens"]
 

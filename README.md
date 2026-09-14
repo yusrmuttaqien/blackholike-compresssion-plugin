@@ -165,21 +165,42 @@ Final output: [sys, summary, sys(injected), user10, user11]
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `priority` | `10` | Priority level for the filter operations. Lower numbers run first. |
-| `compression_threshold_tokens` | `64000` | When total context token count exceeds this value, trigger compression (global default). |
-| `max_context_tokens` | `128000` | Hard limit for context. Exceeding this value will force removal of earliest messages (global default). |
-| `model_thresholds` | `""` (empty) | Per-model threshold overrides. Format: `model_id:compression_threshold:max_context` (comma-separated). Example: `gpt-4:8000:32000,claude-3:100000:200000` |
+| `compression_threshold_percent` | `80` | Trigger compression when the context reaches this percentage of the active model's max context window. |
+| `max_context_tokens` | `128000` | Fallback max context window (tokens), used only when the active model does not declare a `context_length` in its metadata. Set to 0 for "no limit". |
+| `enable_llamacpp_context_probe` | `true` | Probe the llama.cpp server (`GET /props`, then `/v1/models`) to auto-detect the active model's context window when it is not declared in metadata. Results are cached briefly. |
 | `keep_first` | `0` | Keep the first N non-system messages plus all interleaved system messages. Set to 0 to disable. |
 | `keep_last` | `6` | Always keep the last N full messages. |
 | `summary_model` | `None` | The model ID used to generate the summary. If empty, uses the current conversation's model. Recommend a fast, economical, compatible model such as `deepseek-v3`, `gemini-2.5-flash`, or `gpt-4.1`. Must be specified if the conversation uses a pipeline model or a model that does not support standard generation APIs. |
-| `summary_model_max_context` | `0` | Max context tokens for the summary model. If 0, falls back to `model_thresholds` or global `max_context_tokens`. Example: `gemini-flash=1000000, gpt-4o-mini=128000` |
+| `summary_model_max_context` | `0` | Max context tokens for the summary model. If 0, resolves the summary model's own `context_length` (falling back to `max_context_tokens`). |
 | `max_summary_tokens` | `16384` | The maximum number of tokens for the summary. |
 | `summary_temperature` | `0.1` | The temperature for summary generation. Lower values produce more deterministic output. |
+| `summary_chat_template_kwargs` | `{"enable_thinking": false}` | JSON object of chat-template variables sent to the summary model. Useful to disable thinking on backends that honor `chat_template_kwargs` (vLLM, llama.cpp `--jinja`). Leave empty to send none. |
 | `enable_tool_output_trimming` | `true` | Enable trimming of large tool outputs (only works with native function calling). |
 | `tool_trim_threshold_chars` | `600` | Trim native tool outputs when their total content length reaches this many characters. |
 | `show_token_usage_status` | `true` | Show token usage status notification. |
 | `token_usage_status_threshold` | `80` | Only show token usage status when usage exceeds this percentage (0-100). Set to 0 to always show. |
 | `debug_mode` | `false` | Enable detailed logging for debugging. Recommended to set to `false` in production. |
 | `show_debug_log` | `false` | Show debug logs in the frontend console (F12). Useful for frontend debugging. |
+
+### Adaptive context window
+
+The compression threshold is no longer a fixed token count. For each request the plugin resolves the **active model's max context window** and triggers compression at `compression_threshold_percent`% of it. Resolution order:
+
+1. The active model's declared `context_length` (from `__model__["info"]["meta"]`).
+2. The model record in Open WebUI's database (`Models.get_model_by_id(...).meta.context_length`).
+3. For **llama.cpp** connections (when `enable_llamacpp_context_probe` is on), the model's context window queried directly from the server: `GET /props` → `default_generation_settings.n_ctx` (the runtime `--ctx-size`), falling back to `GET /v1/models` → `meta.n_ctx_train`.
+4. The `max_context_tokens` fallback valve.
+
+So a 32k model and a 1M-context model each get their own correct threshold automatically — no per-model configuration required. Set the model's **Context Length** in the Open WebUI model settings (or a global default) to benefit from adaptive behavior.
+
+### llama.cpp auto-detection
+
+Open WebUI never populates `meta.context_length` for OpenAI-compatible connections (including llama.cpp), so this plugin can ask the llama.cpp server itself. When the active model belongs to a connection whose provider is **`llama.cpp`**, the plugin reads the server's runtime context size:
+
+- `GET {server_root}/props` → `default_generation_settings.n_ctx` (respects `--ctx-size`, including multi-slot `--parallel` setups).
+- If `/props` is unavailable, `GET {server_root}/v1/models` → `data[].meta.n_ctx_train` (the model's trained maximum).
+
+The server root is derived from the connection URL by stripping `/api/v1`, `/api/v0`, or `/v1`. Custom (workspace) models resolve the connection through their base model. Results are cached per server+model (5 minutes on a hit, 1 minute on a miss) so the request path is not slowed down. Disable with `enable_llamacpp_context_probe = false` if you prefer to set `max_context_tokens` manually.
 
 ## 💾 Storage
 
@@ -294,7 +315,7 @@ FROM chat_summary;
    - ⚠ There will be a brief background processing time when the threshold is first met.
 4. **Cost Optimization**
    - ⚠ The summary model is called once each time the threshold is met.
-   - ⚠ Set `compression_threshold_tokens` reasonably to avoid frequent calls.
+   - ⚠ Set `compression_threshold_percent` reasonably to avoid frequent calls.
    - ⚠ It's recommended to use a fast and economical model (like `gemini-flash`) to generate summaries.
 5. **Multimodal Support**
    - ✓ This filter supports multimodal messages containing images.
@@ -312,7 +333,7 @@ FROM chat_summary;
 
 **Problem: Summary not generated**
 
-1. Check if the `compression_threshold_tokens` has been met.
+1. Check if the compression threshold (`compression_threshold_percent` of the model's context window) has been met.
 2. Verify that the `summary_model` is configured correctly.
 3. Check the debug logs for any error messages.
 
@@ -322,7 +343,7 @@ FROM chat_summary;
 
 **Problem: Compression effect is not significant**
 
-1. Increase the `compression_threshold_tokens` appropriately.
+1. Lower the `compression_threshold_percent` to compress earlier, and/or set the model's context length so it is detected.
 2. Decrease the number of `keep_last` or `keep_first`.
 3. Check if the conversation is actually long enough.
 

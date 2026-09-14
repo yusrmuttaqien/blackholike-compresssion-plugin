@@ -12,7 +12,6 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         self._fallback_session_factory = (
             sessionmaker(bind=self._db_engine) if self._db_engine else None
         )
-        self._model_thresholds_cache: Optional[Dict[str, Any]] = None
 
         # Fallback mapping for variants not in TRANSLATIONS keys
         self.fallback_map = {
@@ -24,25 +23,28 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         # Concurrency control: Lock per chat session
         self._chat_locks = {}
         self._pending_inlet_messages: Dict[str, List[Dict[str, Any]]] = {}
+        # Cache of probed llama.cpp context sizes: cache_key -> (expires_at, n_ctx)
+        self._llamacpp_context_cache: Dict[str, Any] = {}
         self._init_database()
     class Valves(BaseModel):
         priority: int = Field(
             default=10, description="Priority level for the filter operations."
         )
         # Token related parameters
-        compression_threshold_tokens: int = Field(
-            default=64000,
+        compression_threshold_percent: int = Field(
+            default=80,
             ge=0,
-            description="When total context Token count exceeds this value, trigger compression (Global Default)",
+            le=100,
+            description="Trigger compression when the context reaches this percentage of the active model's max context window.",
         )
         max_context_tokens: int = Field(
             default=128000,
             ge=0,
-            description="Hard limit for context. Exceeding this value will force removal of earliest messages (Global Default)",
+            description="Fallback max context window (tokens), used only when the active model does not declare a context_length in its metadata. Set to 0 for 'no limit'.",
         )
-        model_thresholds: str = Field(
-            default="",
-            description="Per-model threshold overrides. Format: model_id:compression_threshold:max_context (comma-separated). Example: gpt-4:8000:32000, claude-3:100000:200000",
+        enable_llamacpp_context_probe: bool = Field(
+            default=True,
+            description="Probe the llama.cpp server (GET /props, then /v1/models) to auto-detect the active model's context window when it is not declared in metadata.",
         )
 
         keep_first: int = Field(
@@ -55,12 +57,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         )
         summary_model: Optional[str] = Field(
             default=None,
-            description="The model ID used to generate the summary. If empty, uses the current conversation's model. Used to match configurations in model_thresholds.",
+            description="The model ID used to generate the summary. If empty, uses the current conversation's model.",
         )
         summary_model_max_context: int = Field(
             default=0,
             ge=0,
-            description="Max context tokens for the summary model. If 0, falls back to model_thresholds or global max_context_tokens. Example: gemini-flash=1000000, gpt-4o-mini=128000.",
+            description="Max context tokens for the summary model. If 0, resolves the summary model's own context_length (falling back to max_context_tokens).",
         )
         max_summary_tokens: int = Field(
             default=16384,
@@ -172,6 +174,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
 
         chat_ctx = self._get_chat_context(body, __metadata__)
         chat_id = chat_ctx["chat_id"]
+
+        # Transient inlet messages are only consumed by this same turn's outlet.
+        # Drop any leftover from a previous turn whose outlet never ran (e.g. the
+        # request was cancelled), so the map can't accumulate stale entries.
+        if chat_id:
+            self._pending_inlet_messages.pop(chat_id, None)
 
         body = await self._handle_external_chat_references(
             body,
@@ -329,32 +337,19 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 event_call=__event_call__,
             )
 
-            # Log custom model configurations
-            raw_config = self.valves.model_thresholds
-            parsed_configs = self._parse_model_thresholds()
-
-            if raw_config:
-                config_list = [
-                    f"{model}: {cfg['compression_threshold_tokens']}t/{cfg['max_context_tokens']}t"
-                    for model, cfg in parsed_configs.items()
-                ]
-
-                if config_list:
-                    await self._log(
-                        f"[Inlet] 📋 Model Configs (Raw: '{raw_config}'): {', '.join(config_list)}",
-                        event_call=__event_call__,
-                    )
-                else:
-                    await self._log(
-                        f"[Inlet] ⚠️ Invalid Model Configs (Raw: '{raw_config}'): No valid configs parsed. Expected format: 'model_id:threshold:max_context'",
-                        log_type="warning",
-                        event_call=__event_call__,
-                    )
-            else:
-                await self._log(
-                    f"[Inlet] 📋 Model Configs: No custom configuration (Global defaults only)",
-                    event_call=__event_call__,
-                )
+            # Log the resolved adaptive context window for this model
+            resolved_model_id = self._clean_model_id(body.get("model"))
+            resolved_max_context = await self._get_model_max_context(
+                resolved_model_id, __model__
+            )
+            resolved_threshold = self._get_compression_threshold(resolved_max_context)
+            await self._log(
+                f"[Inlet] 📋 Adaptive config: model={resolved_model_id or 'unknown'} | "
+                f"max_context={resolved_max_context}t | "
+                f"compression_threshold={resolved_threshold}t "
+                f"({self.valves.compression_threshold_percent}%)",
+                event_call=__event_call__,
+            )
 
         # Log the aligned compression boundary using the same original-history
         # coordinate mapping as outlet/async summary generation.
@@ -448,12 +443,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 if not is_in_head:
                     calc_messages = [system_prompt_msg] + candidate_messages
 
-            # Get max context limit
+            # Get max context limit (adaptive to the active model)
             model = self._clean_model_id(body.get("model"))
-            thresholds = self._get_model_thresholds(model)
-            max_context_tokens = thresholds.get(
-                "max_context_tokens", self.valves.max_context_tokens
-            )
+            max_context_tokens = await self._get_model_max_context(model, __model__)
 
             # --- Fast Estimation Check ---
             estimated_tokens = self._estimate_messages_tokens(calc_messages)
@@ -672,12 +664,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 if not is_in_messages:
                     calc_messages = [system_prompt_msg] + candidate_messages
 
-            # Get max context limit
+            # Get max context limit (adaptive to the active model)
             model = self._clean_model_id(body.get("model"))
-            thresholds = self._get_model_thresholds(model) or {}
-            max_context_tokens = thresholds.get(
-                "max_context_tokens", self.valves.max_context_tokens
-            )
+            max_context_tokens = await self._get_model_max_context(model, __model__)
 
             # --- Fast Estimation Check ---
             estimated_tokens = self._estimate_messages_tokens(calc_messages)

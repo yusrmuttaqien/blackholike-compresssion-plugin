@@ -83,7 +83,7 @@ from datetime import datetime, timezone
 
 TRANSLATIONS = {
     "en-US": {
-        "status_context_usage": "Context Usage (Estimated): {tokens} / {max_tokens} Tokens ({ratio}%) | Compression at {threshold} Tokens",
+        "status_context_usage": "Context Usage (Estimated): {tokens} / {max_tokens} Tokens ({ratio}%)",
         "status_high_usage": " | ⚠️ High Usage",
         "status_loaded_summary": "Loaded historical summary (Hidden {count} historical messages)",
         "status_context_summary_updated": "Context Summary Updated: {tokens} / {max_tokens} Tokens ({ratio}%)",
@@ -100,7 +100,7 @@ TRANSLATIONS = {
         "content_collapsed": "\n... [Content collapsed] ...\n",
     },
     "zh-CN": {
-        "status_context_usage": "上下文用量 (预估): {tokens} / {max_tokens} Tokens ({ratio}%) | 压缩阈值 {threshold} Tokens",
+        "status_context_usage": "上下文用量 (预估): {tokens} / {max_tokens} Tokens ({ratio}%)",
         "status_high_usage": " | ⚠️ 用量较高",
         "status_loaded_summary": "已加载历史总结 (隐藏了 {count} 条历史消息)",
         "status_context_summary_updated": "上下文总结已更新: {tokens} / {max_tokens} Tokens ({ratio}%)",
@@ -1913,106 +1913,66 @@ class CompressionMixin:
                 max_context_tokens
             )
 
-            # --- Sent-context metric ---
-            # The compression trigger is measured against the reconstructed
-            # context the inlet actually sent to the LLM (head + summary +
-            # preserved system + tail), not the raw full history. The inlet
-            # passes its exact sent-context count through the body; fall back
-            # to counting the outlet's view list when the key is absent.
-            sent_tokens = body.get("__sent_context_tokens__")
-            sent_tokens_estimated = bool(
-                body.get("__sent_context_tokens_estimated__", False)
-            )
-            sent_tokens_source = "inlet"
-            if sent_tokens is None:
-                sent_tokens = self._estimate_messages_tokens(messages)
-                sent_tokens_estimated = True
-                sent_tokens_source = "outlet"
-
-            # Recompute on the exact sent-context list the inlet counted
-            # (messages + injected system prompt), so the trigger and the
-            # displayed usage are on the same basis. Fall back to the raw
-            # view list if the inlet did not pass it through.
-            sent_context_messages = (
-                body.get("__sent_context_messages__") or messages
-            )
-
             await self._log(
-                "\n[🔍 Background Calculation] Sent-context token count...",
+                "\n[🔍 Background Calculation] Starting full-history token count...",
                 event_call=__event_call__,
             )
+
+            # --- Fast Estimation Check ---
+            estimated_tokens = self._estimate_messages_tokens(messages)
 
             # For triggering summary generation, we need to be more precise if we are in the grey zone
             # Margin is 15% (skip tiktoken if estimated is < 85% of threshold)
             # Note: We still use tiktoken if we exceed threshold, because we want an accurate usage status report
-            if (
-                sent_tokens_estimated
-                and compression_threshold_tokens > 0
-                and sent_tokens >= compression_threshold_tokens * 0.85
-            ):
-                estimate_before_recheck = sent_tokens
-                sent_tokens = await asyncio.to_thread(
-                    self._calculate_messages_tokens, sent_context_messages
-                )
-                sent_tokens_estimated = False
-                delta = sent_tokens - estimate_before_recheck
-                delta_pct = (
-                    delta / estimate_before_recheck * 100
-                    if estimate_before_recheck
-                    else 0.0
-                )
+            if estimated_tokens < compression_threshold_tokens * 0.85:
+                current_tokens = estimated_tokens
                 await self._log(
-                    "[🔍 Background Calculation] Grey-zone recheck (estimate vs precise)\n"
-                    f"estimate_source={sent_tokens_source} | estimate={estimate_before_recheck} | "
-                    f"precise={sent_tokens} | delta={delta:+d} ({delta_pct:+.1f}%) | "
-                    f"compression_threshold_tokens={compression_threshold_tokens}",
+                    "[🔍 Background Calculation] Full-history estimate below threshold\n"
+                    f"source_history_tokens_est={current_tokens} | compression_threshold_tokens={compression_threshold_tokens} | precise_count_skipped=true",
                     event_call=__event_call__,
                 )
-
-            await self._log(
-                "[🔍 Background Calculation] Sent-context token count\n"
-                f"sent_context_tokens={sent_tokens} "
-                f"({'estimated' if sent_tokens_estimated else 'precise'}) | "
-                f"compression_threshold_tokens={compression_threshold_tokens}",
-                event_call=__event_call__,
-            )
+            else:
+                # Calculate Token count precisely in a background thread
+                current_tokens = await asyncio.to_thread(
+                    self._calculate_messages_tokens, messages
+                )
+                await self._log(
+                    "[🔍 Background Calculation] Full-history precise token count\n"
+                    f"source_history_tokens={current_tokens}",
+                    event_call=__event_call__,
+                )
 
             # Send status notification (Context Usage format)
             if __event_emitter__:
                 if max_context_tokens > 0:
-                    usage_ratio = sent_tokens / max_context_tokens
+                    usage_ratio = current_tokens / max_context_tokens
                     # Only show status if threshold is met
                     if self._should_show_status(usage_ratio):
                         status_msg = self._get_translation(
                             lang,
                             "status_context_usage",
-                            tokens=sent_tokens,
+                            tokens=current_tokens,
                             max_tokens=max_context_tokens,
                             ratio=f"{usage_ratio*100:.1f}",
-                            threshold=compression_threshold_tokens,
                         )
                         # Show how much the chat has grown since the last summary,
                         # if one exists (best-effort; keep the base line on error).
-                        # The summary marker message separates the summarized
-                        # head from the retained tail in the sent view.
                         try:
-                            summary_index = None
-                            for i, m in enumerate(messages):
-                                if self._is_summary_message(m):
-                                    summary_index = i
-                                    break
-                            if (
-                                summary_index is not None
-                                and summary_index < len(messages)
-                            ):
+                            summary_record = await self._load_summary_record(chat_id)
+                            prev_count = (
+                                summary_record.compressed_message_count or 0
+                                if summary_record
+                                else 0
+                            )
+                            if 0 < prev_count < len(messages):
                                 since_tokens = self._estimate_messages_tokens(
-                                    messages[summary_index + 1 :]
+                                    messages[prev_count:]
                                 )
                                 status_msg += self._get_translation(
                                     lang,
                                     "status_since_last_summary",
                                     tokens=since_tokens,
-                                    messages=len(messages) - summary_index - 1,
+                                    messages=len(messages) - prev_count,
                                 )
                         except Exception:
                             pass
@@ -2033,10 +1993,10 @@ class CompressionMixin:
                         )
 
             # Check if compression is needed
-            if compression_threshold_tokens > 0 and sent_tokens >= compression_threshold_tokens:
+            if compression_threshold_tokens > 0 and current_tokens >= compression_threshold_tokens:
                 await self._log(
-                    "[🔍 Background Calculation] ⚡ Sent-context threshold triggered\n"
-                    f"sent_context_tokens={sent_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
+                    "[🔍 Background Calculation] ⚡ Full-history threshold triggered\n"
+                    f"source_history_tokens={current_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
                     event_call=__event_call__,
                 )
 
@@ -2051,12 +2011,12 @@ class CompressionMixin:
                     __event_emitter__,
                     __event_call__,
                     __request__,
-                    pre_compression_tokens=sent_tokens,
+                    pre_compression_tokens=current_tokens,
                 )
             else:
                 await self._log(
-                    "[🔍 Background Calculation] Sent-context threshold not reached\n"
-                    f"sent_context_tokens={sent_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
+                    "[🔍 Background Calculation] Full-history threshold not reached\n"
+                    f"source_history_tokens={current_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
                     event_call=__event_call__,
                 )
 
@@ -2504,9 +2464,6 @@ class SummarizeMixin:
                     max_context_tokens = await self._get_model_max_context(
                         model, (body.get("metadata") or {}).get("model")
                     )
-                    compression_threshold_tokens = (
-                        self._get_compression_threshold(max_context_tokens)
-                    )
                     # 6. Emit Status (only if threshold is met)
                     if max_context_tokens > 0:
                         usage_ratio = token_count / max_context_tokens
@@ -2518,7 +2475,6 @@ class SummarizeMixin:
                                 tokens=token_count,
                                 max_tokens=max_context_tokens,
                                 ratio=f"{usage_ratio*100:.1f}",
-                                threshold=compression_threshold_tokens,
                             )
                             if (
                                 pre_compression_tokens
@@ -3888,9 +3844,6 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             # Get max context limit (adaptive to the active model)
             model = self._clean_model_id(body.get("model"))
             max_context_tokens = await self._get_model_max_context(model, __model__)
-            compression_threshold_tokens = self._get_compression_threshold(
-                max_context_tokens
-            )
 
             # --- Fast Estimation Check ---
             estimated_tokens = self._estimate_messages_tokens(calc_messages)
@@ -4022,21 +3975,6 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 event_call=__event_call__,
             )
 
-            # Record the exact sent-context size for the outlet trigger metric.
-            # Also pass the exact sent-context list (post-reduction messages +
-            # injected system prompt) so the outlet recomputes on the same
-            # basis as the inlet — the basis the trigger actually tests.
-            sent_context_messages = candidate_messages
-            if system_prompt_msg and not any(
-                m.get("role") == "system" for m in head_messages
-            ):
-                sent_context_messages = [system_prompt_msg] + candidate_messages
-            body["__sent_context_tokens__"] = total_section_tokens
-            body["__sent_context_tokens_estimated__"] = (
-                total_tokens == estimated_tokens
-            )
-            body["__sent_context_messages__"] = sent_context_messages
-
             # Prepare status message (Context Usage format)
             if max_context_tokens > 0:
                 usage_ratio = total_section_tokens / max_context_tokens
@@ -4048,7 +3986,6 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                         tokens=total_section_tokens,
                         max_tokens=max_context_tokens,
                         ratio=f"{usage_ratio*100:.1f}",
-                        threshold=compression_threshold_tokens,
                     )
                     if usage_ratio > 0.9:
                         status_msg += self._get_translation(lang, "status_high_usage")
@@ -4128,9 +4065,6 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             # Get max context limit (adaptive to the active model)
             model = self._clean_model_id(body.get("model"))
             max_context_tokens = await self._get_model_max_context(model, __model__)
-            compression_threshold_tokens = self._get_compression_threshold(
-                max_context_tokens
-            )
 
             # --- Fast Estimation Check ---
             estimated_tokens = self._estimate_messages_tokens(calc_messages)
@@ -4216,21 +4150,6 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                     event_call=__event_call__,
                 )
 
-            # Record the exact sent-context size for the outlet trigger metric.
-            # Also pass the exact sent-context list (post-reduction messages +
-            # injected system prompt) so the outlet recomputes on the same
-            # basis as the inlet — the basis the trigger actually tests.
-            sent_context_messages = candidate_messages
-            if system_prompt_msg and not any(
-                m.get("role") == "system" for m in candidate_messages
-            ):
-                sent_context_messages = [system_prompt_msg] + candidate_messages
-            body["__sent_context_tokens__"] = total_tokens
-            body["__sent_context_tokens_estimated__"] = (
-                total_tokens == estimated_tokens
-            )
-            body["__sent_context_messages__"] = sent_context_messages
-
             # Send status notification (Context Usage format)
             if max_context_tokens > 0:
                 usage_ratio = total_tokens / max_context_tokens
@@ -4242,7 +4161,6 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                         tokens=total_tokens,
                         max_tokens=max_context_tokens,
                         ratio=f"{usage_ratio*100:.1f}",
-                        threshold=compression_threshold_tokens,
                     )
                     if usage_ratio > 0.9:
                         status_msg += self._get_translation(lang, "status_high_usage")

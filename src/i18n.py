@@ -5,7 +5,7 @@
 
 TRANSLATIONS = {
     "en-US": {
-        "status_context_usage": "Context Usage (Estimated): {tokens} / {max_tokens} Tokens ({ratio}%) | Compression at {threshold} Tokens",
+        "status_context_usage": "Context Usage (Estimated): {tokens} / {max_tokens} Tokens ({ratio}%)",
         "status_high_usage": " | ⚠️ High Usage",
         "status_loaded_summary": "Loaded historical summary (Hidden {count} historical messages)",
         "status_context_summary_updated": "Context Summary Updated: {tokens} / {max_tokens} Tokens ({ratio}%)",
@@ -22,7 +22,7 @@ TRANSLATIONS = {
         "content_collapsed": "\n... [Content collapsed] ...\n",
     },
     "zh-CN": {
-        "status_context_usage": "上下文用量 (预估): {tokens} / {max_tokens} Tokens ({ratio}%) | 压缩阈值 {threshold} Tokens",
+        "status_context_usage": "上下文用量 (预估): {tokens} / {max_tokens} Tokens ({ratio}%)",
         "status_high_usage": " | ⚠️ 用量较高",
         "status_loaded_summary": "已加载历史总结 (隐藏了 {count} 条历史消息)",
         "status_context_summary_updated": "上下文总结已更新: {tokens} / {max_tokens} Tokens ({ratio}%)",

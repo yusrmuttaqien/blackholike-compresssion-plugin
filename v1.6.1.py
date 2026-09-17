@@ -88,6 +88,10 @@ TRANSLATIONS = {
         "status_loaded_summary": "Loaded historical summary (Hidden {count} historical messages)",
         "status_context_summary_updated": "Context Summary Updated: {tokens} / {max_tokens} Tokens ({ratio}%)",
         "status_generating_summary": "Generating context summary in background...",
+        "status_compressing_history": "Compressing conversation history ({count} messages)...",
+        "status_saving_summary": "Saving context summary...",
+        "status_since_last_summary": " | +{tokens} tokens ({messages} messages) since last summary",
+        "status_saved_tokens": " | ✅ Saved ~{tokens} tokens",
         "status_summary_error": "Summary Error: {error} | Check browser console (F12) for details",
         "status_external_refs_injected": "Bypassed chat RAG and injected {count} referenced chat context(s)",
         "summary_prompt_prefix": "【Previous Summary: The following is a summary of the historical conversation, provided for context only. Do not reply to the summary content itself; answer the subsequent latest questions directly.】\n\n",
@@ -101,6 +105,10 @@ TRANSLATIONS = {
         "status_loaded_summary": "已加载历史总结 (隐藏了 {count} 条历史消息)",
         "status_context_summary_updated": "上下文总结已更新: {tokens} / {max_tokens} Tokens ({ratio}%)",
         "status_generating_summary": "正在后台生成上下文总结...",
+        "status_compressing_history": "正在压缩对话历史（{count} 条消息）...",
+        "status_saving_summary": "正在保存上下文总结...",
+        "status_since_last_summary": " | 自上次总结以来 +{tokens} tokens（{messages} 条消息）",
+        "status_saved_tokens": " | ✅ 已节省约 {tokens} tokens",
         "status_summary_error": "总结生成错误: {error} | 请查看浏览器控制台(F12)获取详情",
         "status_external_refs_injected": "已绕过 chat RAG，并注入 {count} 个引用聊天上下文",
         "summary_prompt_prefix": "【前情提要：以下是历史对话的总结，仅供上下文参考。请不要回复总结内容本身，直接回答之后最新的问题。】\n\n",
@@ -1947,6 +1955,28 @@ class CompressionMixin:
                             max_tokens=max_context_tokens,
                             ratio=f"{usage_ratio*100:.1f}",
                         )
+                        # Show how much the chat has grown since the last summary,
+                        # if one exists (best-effort; keep the base line on error).
+                        try:
+                            summary_record = await self._load_summary_record(chat_id)
+                            prev_count = (
+                                summary_record.compressed_message_count or 0
+                                if summary_record
+                                else 0
+                            )
+                            if 0 < prev_count < len(messages):
+                                since_tokens = self._estimate_messages_tokens(
+                                    messages[prev_count:]
+                                )
+                                status_msg += self._get_translation(
+                                    lang,
+                                    "status_since_last_summary",
+                                    tokens=since_tokens,
+                                    messages=len(messages) - prev_count,
+                                )
+                        except Exception:
+                            pass
+
                         if usage_ratio > 0.9:
                             status_msg += self._get_translation(
                                 lang, "status_high_usage"
@@ -1981,6 +2011,7 @@ class CompressionMixin:
                     __event_emitter__,
                     __event_call__,
                     __request__,
+                    pre_compression_tokens=current_tokens,
                 )
             else:
                 await self._log(
@@ -2043,6 +2074,7 @@ class SummarizeMixin:
         __event_emitter__: Callable[[Any], Awaitable[None]] = None,
         __event_call__: Callable[[Any], Awaitable[None]] = None,
         __request__: Request = None,
+        pre_compression_tokens: Optional[int] = None,
     ):
         """
         Generates summary asynchronously (runs in background, does not block response).
@@ -2252,6 +2284,23 @@ class SummarizeMixin:
                 )
                 return
 
+            # Stage 1 status: tell the user how much history is being compressed
+            # (the shimmer resolves into the next stage while the LLM call runs).
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": self._get_translation(
+                                lang,
+                                "status_compressing_history",
+                                count=len(middle_messages) - protected_prefix,
+                            ),
+                            "done": False,
+                        },
+                    }
+                )
+
             # 4. Build conversation text using the fitted request payload.
             conversation_text = self._format_messages_for_summary(middle_messages)
             if max_context_tokens > 0:
@@ -2305,6 +2354,20 @@ class SummarizeMixin:
                 "[Optimization] Saving summary in a background thread to avoid blocking the event loop.",
                 event_call=__event_call__,
             )
+
+            # Stage 3 status: persisting the result.
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": self._get_translation(
+                                lang, "status_saving_summary"
+                            ),
+                            "done": False,
+                        },
+                    }
+                )
 
             await self._save_summary(chat_id, new_summary, saved_compressed_count)
 
@@ -2413,6 +2476,15 @@ class SummarizeMixin:
                                 max_tokens=max_context_tokens,
                                 ratio=f"{usage_ratio*100:.1f}",
                             )
+                            if (
+                                pre_compression_tokens
+                                and pre_compression_tokens > token_count
+                            ):
+                                status_msg += self._get_translation(
+                                    lang,
+                                    "status_saved_tokens",
+                                    tokens=pre_compression_tokens - token_count,
+                                )
                             if usage_ratio > 0.9:
                                 status_msg += self._get_translation(
                                     lang, "status_high_usage"

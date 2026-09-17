@@ -825,28 +825,6 @@ class CompressionMixin:
                             max_tokens=max_context_tokens,
                             ratio=f"{usage_ratio*100:.1f}",
                         )
-                        # Show how much the chat has grown since the last summary,
-                        # if one exists (best-effort; keep the base line on error).
-                        try:
-                            summary_record = await self._load_summary_record(chat_id)
-                            prev_count = (
-                                summary_record.compressed_message_count or 0
-                                if summary_record
-                                else 0
-                            )
-                            if 0 < prev_count < len(messages):
-                                since_tokens = self._estimate_messages_tokens(
-                                    messages[prev_count:]
-                                )
-                                status_msg += self._get_translation(
-                                    lang,
-                                    "status_since_last_summary",
-                                    tokens=since_tokens,
-                                    messages=len(messages) - prev_count,
-                                )
-                        except Exception:
-                            pass
-
                         if usage_ratio > 0.9:
                             status_msg += self._get_translation(
                                 lang, "status_high_usage"
@@ -881,7 +859,6 @@ class CompressionMixin:
                     __event_emitter__,
                     __event_call__,
                     __request__,
-                    pre_compression_tokens=current_tokens,
                 )
             else:
                 await self._log(

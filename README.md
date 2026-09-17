@@ -202,16 +202,6 @@ Open WebUI never populates `meta.context_length` for OpenAI-compatible connectio
 
 The server root is derived from the connection URL by stripping `/api/v1`, `/api/v0`, or `/v1`. Custom (workspace) models resolve the connection through their base model. Results are cached per server+model (5 minutes on a hit, 1 minute on a miss) so the request path is not slowed down. Disable with `enable_llamacpp_context_probe = false` if you prefer to set `max_context_tokens` manually.
 
-### Chat status line
-
-The plugin reports compression stats and progress as status lines above the assistant's response (the same UI element Open WebUI uses for web search):
-
-- **Before compression** (when usage is high enough, see the valves below): `Context Usage (Estimated): 120432 / 131072 Tokens (91.9%) | +45210 tokens (34 messages) since last summary | ⚠️ High Usage` — the "since last summary" part only appears when a previous summary exists, and "⚠️ High Usage" only above 90%.
-- **During compression** (shimmering, in sequence): `Compressing conversation history (142 messages)...` → `Generating context summary in background...` → `Saving context summary...`
-- **After compression:** the updated usage line with ` | ✅ Saved ~87000 tokens` appended — the tokens this compression removed from future context.
-
-The usage lines are controlled by the existing valves: `show_token_usage_status` toggles them and `token_usage_status_threshold` sets the usage percentage at which they appear (0 = always). The stage shimmers are always shown while a summary is being generated.
-
 ## 💾 Storage
 
 This filter uses Open WebUI's shared database connection for persistent storage. It automatically reuses Open WebUI's internal SQLAlchemy engine and `SessionLocal`, making the plugin database-agnostic and ensuring compatibility with any database backend that Open WebUI supports (PostgreSQL, SQLite, etc.).

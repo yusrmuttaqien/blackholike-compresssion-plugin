@@ -31,8 +31,9 @@ class ExternalRefsMixin:
             )
 
         model_id = self._clean_model_id(body.get("model"))
-        max_context_tokens = await self._get_model_max_context(
-            model_id, (body.get("metadata") or {}).get("model")
+        thresholds = self._get_model_thresholds(model_id) or {}
+        max_context_tokens = thresholds.get(
+            "max_context_tokens", self.valves.max_context_tokens
         )
         max_summary_tokens = self.valves.max_summary_tokens or 4096
         summary_model = (
@@ -40,9 +41,7 @@ class ExternalRefsMixin:
             or self._clean_model_id(body.get("model"))
             or "gpt-4o-mini"
         )
-        summary_model_max_context = await self._get_summary_model_context_limit(
-            summary_model
-        )
+        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
 
         base_messages = body.get("messages", [])
         base_message_tokens = self._estimate_messages_tokens(base_messages)
@@ -270,9 +269,7 @@ class ExternalRefsMixin:
 
         generated_summaries = []
         summary_model = self._clean_model_id(self.valves.summary_model) or "gpt-4o-mini"
-        summary_model_max_context = await self._get_summary_model_context_limit(
-            summary_model
-        )
+        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
 
         for referenced_chat in referenced_chats:
             if not isinstance(referenced_chat, dict):

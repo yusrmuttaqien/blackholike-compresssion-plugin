@@ -30,10 +30,6 @@ logger = logging.getLogger(__name__)
 
 SUMMARY_METADATA_SOURCE = "async_context_compression"
 
-# Upper bound on how many chats we remember transient inlet messages for (used by
-# outlet to rebuild the sent context). Prevents unbounded growth across chats.
-PENDING_INLET_MAX_CHATS = 64
-
 # Open WebUI built-in imports
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.models.users import Users
@@ -57,18 +53,6 @@ try:
     import tiktoken
 except ImportError:
     tiktoken = None
-
-# Async HTTP client for provider-side capability probes (llama.cpp /props)
-try:
-    import aiohttp
-except ImportError:  # pragma: no cover - Open WebUI always ships aiohttp
-    aiohttp = None
-
-# Open WebUI >= 0.10 stores connections in the config table; <= 0.9.x uses app.state.config
-try:
-    from open_webui.models.config import Config as OWUIConfig
-except (ModuleNotFoundError, ImportError):  # pragma: no cover - older Open WebUI
-    OWUIConfig = None
 
 # Database imports
 from sqlalchemy import Column, String, Text, DateTime, Integer, inspect
@@ -467,6 +451,20 @@ async def _call_db(method, *args, **kwargs):
         return await method(*args, **kwargs)
     else:
         return method(*args, **kwargs)
+
+
+def _call_db_sync(method, *args, **kwargs):
+    """
+    Call an OpenWebUI DB model method with version-aware async handling (for sync contexts).
+    - OpenWebUI <  0.9.0: DB methods are sync, call directly.
+    - OpenWebUI >= 0.9.0: DB methods are async, run in a separate thread with its own event loop.
+    """
+    if not _owui_version_ge("0.9.0"):
+        return method(*args, **kwargs)
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, method(*args, **kwargs)).result()
 
 
 class ChatSummary(owui_Base):
@@ -1155,11 +1153,6 @@ class CompressionMixin:
 
         if pending_messages:
             self._pending_inlet_messages[chat_id] = pending_messages
-            # Bound memory: the dict is insertion-ordered, so evict the oldest
-            # chats once we exceed the cap.
-            while len(self._pending_inlet_messages) > PENDING_INLET_MAX_CHATS:
-                oldest_chat_id = next(iter(self._pending_inlet_messages))
-                self._pending_inlet_messages.pop(oldest_chat_id, None)
         else:
             self._pending_inlet_messages.pop(chat_id, None)
 
@@ -1442,333 +1435,111 @@ class CompressionMixin:
             "user_language": user_language,
         }
 
-    def _extract_model_context_length(
-        self, model_dict: Optional[dict]
-    ) -> Optional[int]:
-        """Pull context_length out of a model dict, tolerating both shapes.
+    def _parse_model_thresholds(self) -> Dict[str, Any]:
+        """Parse model_thresholds string into a dictionary.
 
-        Accepts either the filter's ``__model__`` dict or
-        ``body["metadata"]["model"]``; both expose metadata at
-        ``["info"]["meta"]``, while a DB model dump flattens it to ``["meta"]``.
-        Returns None when the value is missing or not a positive number.
+        Format: model_id:compression_threshold:max_context, model_id2:threshold2:max2
+        Example: gpt-4:8000:32000, claude-3:100000:200000
+
+        Returns cached result if already parsed.
         """
-        if not isinstance(model_dict, dict):
-            return None
+        if self._model_thresholds_cache is not None:
+            return self._model_thresholds_cache
 
-        meta = None
-        info = model_dict.get("info")
-        if isinstance(info, dict):
-            meta = info.get("meta")
-        if not isinstance(meta, dict):
-            meta = model_dict.get("meta")
-        if not isinstance(meta, dict):
-            return None
+        self._model_thresholds_cache = {}
+        raw_config = self.valves.model_thresholds
+        if not raw_config:
+            return self._model_thresholds_cache
 
-        value = meta.get("context_length")
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)) and value > 0:
-            return int(value)
-        return None
+        for entry in raw_config.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
 
-    async def _get_model_max_context(
-        self, model_id: str, model_dict: Optional[dict] = None
-    ) -> int:
-        """Resolve the active model's max context window, in tokens.
+            parts = entry.split(":")
+            if len(parts) != 3:
+                continue
+
+            try:
+                model_id = parts[0].strip()
+                compression_threshold = int(parts[1].strip())
+                max_context = int(parts[2].strip())
+
+                self._model_thresholds_cache[model_id] = {
+                    "compression_threshold_tokens": compression_threshold,
+                    "max_context_tokens": max_context,
+                }
+            except ValueError:
+                continue
+
+        return self._model_thresholds_cache
+
+    def _get_model_thresholds(self, model_id: str) -> Dict[str, int]:
+        """Gets threshold configuration for a specific model.
 
         Priority:
-        1. ``model_dict`` metadata (``["info"]["meta"]["context_length"]``)
-           — fast, no DB hit. ``model_dict`` is the filter's ``__model__`` or
-           ``body["metadata"]["model"]``.
-        2. Database lookup via ``Models.get_model_by_id``.
-        3. llama.cpp server probe (``GET /props`` / ``/v1/models``) when the
-           active model is served through a llama.cpp connection.
-        4. Fallback to the global ``max_context_tokens`` valve (0 = no limit).
+        1. If configuration exists for the model ID in model_thresholds, use it.
+        2. If model is a custom model, try to match its base_model_id.
+        3. Otherwise, use global parameters compression_threshold_tokens and max_context_tokens.
         """
-        resolved = self._extract_model_context_length(model_dict)
-        if resolved:
-            if self.valves.debug_mode:
-                logger.info(
-                    f"[Config] Model '{model_id}': using declared context_length={resolved}"
-                )
-            return resolved
+        parsed = self._parse_model_thresholds()
 
+        # 1. Direct match with model_id
+        if model_id in parsed:
+            if self.valves.debug_mode:
+                logger.info(f"[Config] Using model-specific configuration: {model_id}")
+            return parsed[model_id]
+
+        # 2. Try to find base_model_id for custom models
         try:
-            model_obj = await _call_db(Models.get_model_by_id, model_id)
-            if model_obj is not None:
-                meta = getattr(model_obj, "meta", None)
-                if hasattr(meta, "model_dump"):
-                    meta = meta.model_dump()
-                resolved = self._extract_model_context_length({"meta": meta})
-                if resolved:
+            model_obj = _call_db_sync(Models.get_model_by_id, model_id)
+            if model_obj:
+                # Check for base_model_id (custom model)
+                base_model_id = getattr(model_obj, "base_model_id", None)
+                if not base_model_id:
+                    # Try base_model_ids (array) - take first one
+                    base_model_ids = getattr(model_obj, "base_model_ids", None)
+                    if (
+                        base_model_ids
+                        and isinstance(base_model_ids, list)
+                        and len(base_model_ids) > 0
+                    ):
+                        base_model_id = base_model_ids[0]
+
+                if base_model_id and base_model_id in parsed:
                     if self.valves.debug_mode:
                         logger.info(
-                            f"[Config] Model '{model_id}': context_length={resolved} (from DB)"
+                            f"[Config] Custom model '{model_id}' -> base_model '{base_model_id}': using base model configuration"
                         )
-                    return resolved
+                    return parsed[base_model_id]
         except Exception as e:
             if self.valves.debug_mode:
                 logger.warning(
-                    f"[Config] Failed to resolve context_length for '{model_id}': {e}"
+                    f"[Config] Failed to lookup base_model for '{model_id}': {e}"
                 )
 
-        if self.valves.enable_llamacpp_context_probe:
-            resolved = await self._get_llamacpp_context(model_id, model_dict)
-            if resolved:
-                if self.valves.debug_mode:
-                    logger.info(
-                        f"[Config] Model '{model_id}': context_length={resolved} "
-                        f"(from llama.cpp server probe)"
-                    )
-                return resolved
-
+        # 3. Use global default configuration
         if self.valves.debug_mode:
             logger.info(
-                f"[Config] Model '{model_id}' has no declared context_length; "
-                f"using fallback max_context_tokens={self.valves.max_context_tokens}"
+                f"[Config] Model {model_id} not in model_thresholds, using global parameters"
             )
-        return self.valves.max_context_tokens
 
-    def _get_compression_threshold(self, max_context_tokens: int) -> int:
-        """Compute the compression trigger from the max context window.
+        return {
+            "compression_threshold_tokens": self.valves.compression_threshold_tokens,
+            "max_context_tokens": self.valves.max_context_tokens,
+        }
 
-        Returns ``compression_threshold_percent``% of ``max_context_tokens``,
-        or 0 when the window is unlimited/unknown (``max_context_tokens <= 0``),
-        in which case compression is skipped.
-        """
-        if max_context_tokens <= 0:
-            return 0
-        return int(
-            max_context_tokens * self.valves.compression_threshold_percent / 100
-        )
-
-    # ── llama.cpp context auto-detection ──────────────────────────────
-    # Open WebUI exposes no context length for OpenAI-compatible connections,
-    # so for llama.cpp we ask the server itself (GET /props → runtime n_ctx,
-    # GET /v1/models → n_ctx_train fallback) and cache the answer briefly.
-
-    @staticmethod
-    def _extract_llamacpp_n_ctx(payload: Optional[dict]) -> Optional[int]:
-        """Read the runtime context size from a llama.cpp ``/props`` response."""
-        if not isinstance(payload, dict):
-            return None
-        for container in (payload.get("default_generation_settings"), payload):
-            if isinstance(container, dict):
-                value = container.get("n_ctx")
-                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                    return value
-        return None
-
-    @staticmethod
-    def _extract_llamacpp_n_ctx_train(
-        payload: Optional[dict], model_id: Optional[str] = None
-    ) -> Optional[int]:
-        """Read ``n_ctx_train`` from a llama.cpp ``/v1/models`` response."""
-        if not isinstance(payload, dict):
-            return None
-        data = payload.get("data")
-        if not isinstance(data, list):
-            return None
-        entries = [e for e in data if isinstance(e, dict)]
-        preferred = [e for e in entries if model_id and e.get("id") == model_id]
-        for entry in preferred or entries:
-            meta = entry.get("meta")
-            if isinstance(meta, dict):
-                value = meta.get("n_ctx_train")
-                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                    return value
-        return None
-
-    @staticmethod
-    def _llamacpp_root_url(url: Optional[str]) -> Optional[str]:
-        """Strip the OpenAI API suffix from a connection URL."""
-        if not isinstance(url, str) or not url.strip():
-            return None
-        root = url.strip().rstrip("/")
-        for suffix in ("/api/v1", "/api/v0", "/v1"):
-            if root.endswith(suffix):
-                return root[: -len(suffix)]
-        return root
-
-    def _find_model_dict(self, model_id: Optional[str]) -> Optional[dict]:
-        """Look up a model dict in Open WebUI's global model registry."""
-        if not model_id:
-            return None
-        state = getattr(webui_app, "state", None)
-        for attr in ("MODELS", "OPENAI_MODELS"):
-            registry = getattr(state, attr, None)
-            if not registry:
-                continue
-            try:
-                found = registry.get(model_id)
-            except Exception:
-                found = None
-            if isinstance(found, dict):
-                return found
-        return None
-
-    async def _get_openai_connection_config(self, url_idx: int) -> tuple:
-        """Resolve an Open WebUI OpenAI-compatible connection by index.
-
-        Returns ``(base_url, api_key, api_config)`` or ``(None, None, {})``.
-        Supports both the legacy ``app.state.config`` (Open WebUI <= 0.9.x)
-        and the config table used by newer releases.
-        """
-        # Open WebUI <= 0.9.x keeps connections on app.state.config
-        cfg = getattr(getattr(webui_app, "state", None), "config", None)
-        urls = getattr(cfg, "OPENAI_API_BASE_URLS", None)
-        if isinstance(urls, (list, tuple)) and 0 <= url_idx < len(urls):
-            keys = getattr(cfg, "OPENAI_API_KEYS", None) or []
-            configs = getattr(cfg, "OPENAI_API_CONFIGS", None) or {}
-            url = urls[url_idx]
-            key = keys[url_idx] if url_idx < len(keys) else ""
-            api_config = configs.get(str(url_idx), configs.get(url, {})) or {}
-            return url, key, api_config
-
-        if OWUIConfig is not None:
-            try:
-                values = await OWUIConfig.get_many(
-                    "openai.api_base_urls",
-                    "openai.api_keys",
-                    "openai.api_configs",
-                )
-                urls = values.get("openai.api_base_urls") or []
-                if 0 <= url_idx < len(urls):
-                    keys = values.get("openai.api_keys") or []
-                    configs = values.get("openai.api_configs") or {}
-                    url = urls[url_idx]
-                    key = keys[url_idx] if url_idx < len(keys) else ""
-                    api_config = configs.get(str(url_idx), configs.get(url, {})) or {}
-                    return url, key, api_config
-            except Exception as e:
-                if self.valves.debug_mode:
-                    logger.warning(
-                        f"[Config] Failed to read OpenAI connection config: {e}"
-                    )
-        return None, None, {}
-
-    async def _probe_llamacpp_context(
-        self,
-        root_url: str,
-        api_key: Optional[str],
-        raw_model_id: Optional[str],
-        model_id: Optional[str],
-    ) -> Optional[int]:
-        """Query a llama.cpp server for the active model's context size."""
-        if aiohttp is None:
-            return None
-
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        timeout = aiohttp.ClientTimeout(total=5)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                # 1. /props reports the runtime context size (--ctx-size).
-                param_sets = [None]
-                if raw_model_id:
-                    param_sets.append({"model": raw_model_id})
-                for params in param_sets:
-                    try:
-                        async with session.get(
-                            f"{root_url}/props", headers=headers, params=params
-                        ) as resp:
-                            if resp.status == 200:
-                                resolved = self._extract_llamacpp_n_ctx(
-                                    await resp.json(content_type=None)
-                                )
-                                if resolved:
-                                    return resolved
-                    except Exception:
-                        continue
-
-                # 2. /v1/models exposes the trained context size as a fallback.
-                try:
-                    async with session.get(
-                        f"{root_url}/v1/models", headers=headers
-                    ) as resp:
-                        if resp.status == 200:
-                            return self._extract_llamacpp_n_ctx_train(
-                                await resp.json(content_type=None),
-                                raw_model_id or model_id,
-                            )
-                except Exception:
-                    pass
-        except Exception as e:
-            if self.valves.debug_mode:
-                logger.warning(f"[Config] llama.cpp probe failed for {root_url}: {e}")
-        return None
-
-    async def _get_llamacpp_context(
-        self, model_id: Optional[str], model_dict: Optional[dict] = None
-    ) -> Optional[int]:
-        """Resolve a llama.cpp model's context window from its server.
-
-        Only runs when the active model belongs to a llama.cpp connection.
-        Results (including misses) are cached to keep the request path cheap.
-        """
-        model_dict = (
-            model_dict
-            if isinstance(model_dict, dict)
-            else self._find_model_dict(model_id)
-        )
-        if not isinstance(model_dict, dict):
-            return None
-
-        # Resolve the connection index (custom models carry no urlIdx).
-        url_idx = model_dict.get("urlIdx")
-        raw_model = model_dict.get("openai")
-        raw_model_id = raw_model.get("id") if isinstance(raw_model, dict) else None
-        if not isinstance(url_idx, int):
-            info = model_dict.get("info")
-            base_id = info.get("base_model_id") if isinstance(info, dict) else None
-            base_dict = self._find_model_dict(base_id)
-            if isinstance(base_dict, dict):
-                url_idx = base_dict.get("urlIdx")
-                if raw_model is None:
-                    raw_model = base_dict.get("openai")
-                    raw_model_id = (
-                        raw_model.get("id") if isinstance(raw_model, dict) else None
-                    )
-        if not isinstance(url_idx, int):
-            return None
-
-        base_url, api_key, api_config = await self._get_openai_connection_config(
-            url_idx
-        )
-        root_url = self._llamacpp_root_url(base_url)
-        if not root_url:
-            return None
-
-        provider = (api_config or {}).get("provider") or model_dict.get("provider") or ""
-        owned_by = raw_model.get("owned_by") if isinstance(raw_model, dict) else ""
-        if provider != "llama.cpp" and owned_by != "llamacpp":
-            return None
-
-        cache_key = f"{root_url}|{raw_model_id or model_id}"
-        now = time.time()
-        cached = self._llamacpp_context_cache.get(cache_key)
-        if cached and cached[0] > now:
-            return cached[1]
-
-        resolved = await self._probe_llamacpp_context(
-            root_url, api_key, raw_model_id, model_id
-        )
-        # Cache hits for 5 minutes, misses for 1 to avoid hammering the server.
-        self._llamacpp_context_cache[cache_key] = (
-            now + (300 if resolved else 60),
-            resolved,
-        )
-        return resolved
-
-    async def _get_summary_model_context_limit(self, model_id: Optional[str]) -> int:
+    def _get_summary_model_context_limit(self, model_id: Optional[str]) -> int:
         """Resolve the effective input context window for summary requests."""
+        cleaned_model_id = self._clean_model_id(model_id)
+        thresholds = (
+            self._get_model_thresholds(cleaned_model_id) if cleaned_model_id else {}
+        ) or {}
+
         if self.valves.summary_model_max_context > 0:
             return self.valves.summary_model_max_context
 
-        cleaned_model_id = self._clean_model_id(model_id)
-        if not cleaned_model_id:
-            return self.valves.max_context_tokens
-
-        return await self._get_model_max_context(cleaned_model_id)
+        return thresholds.get("max_context_tokens", self.valves.max_context_tokens)
 
     def _get_chat_context(
         self, body: dict, __metadata__: Optional[dict] = None
@@ -1847,24 +1618,17 @@ class CompressionMixin:
     ):
         """Wrapper to run summary generation with an async lock."""
         async with lock:
-            try:
-                await self._check_and_generate_summary_async(
-                    chat_id,
-                    model,
-                    body,
-                    user_data,
-                    target_compressed_count,
-                    lang,
-                    __event_emitter__,
-                    __event_call__,
-                    __request__,
-                )
-            finally:
-                # Drop the per-chat lock while still holding it so the map stays
-                # bounded. The identity check avoids removing a lock that a newer
-                # task may have already installed in its place.
-                if self._chat_locks.get(chat_id) is lock:
-                    self._chat_locks.pop(chat_id, None)
+            await self._check_and_generate_summary_async(
+                chat_id,
+                model,
+                body,
+                user_data,
+                target_compressed_count,
+                lang,
+                __event_emitter__,
+                __event_call__,
+                __request__,
+            )
 
     async def _check_and_generate_summary_async(
         self,
@@ -1898,11 +1662,10 @@ class CompressionMixin:
                     event_call=__event_call__,
                 )
 
-            # Resolve the active model's context window and derive the trigger
-            model_meta = (body.get("metadata") or {}).get("model")
-            max_context_tokens = await self._get_model_max_context(model, model_meta)
-            compression_threshold_tokens = self._get_compression_threshold(
-                max_context_tokens
+            # Get threshold configuration for current model
+            thresholds = self._get_model_thresholds(model) or {}
+            compression_threshold_tokens = thresholds.get(
+                "compression_threshold_tokens", self.valves.compression_threshold_tokens
             )
 
             await self._log(
@@ -1936,6 +1699,9 @@ class CompressionMixin:
 
             # Send status notification (Context Usage format)
             if __event_emitter__:
+                max_context_tokens = thresholds.get(
+                    "max_context_tokens", self.valves.max_context_tokens
+                )
                 if max_context_tokens > 0:
                     usage_ratio = current_tokens / max_context_tokens
                     # Only show status if threshold is met
@@ -1963,7 +1729,7 @@ class CompressionMixin:
                         )
 
             # Check if compression is needed
-            if compression_threshold_tokens > 0 and current_tokens >= compression_threshold_tokens:
+            if current_tokens >= compression_threshold_tokens:
                 await self._log(
                     "[🔍 Background Calculation] ⚡ Full-history threshold triggered\n"
                     f"source_history_tokens={current_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
@@ -2132,7 +1898,7 @@ class SummarizeMixin:
                 )
                 return
 
-            max_context_tokens = await self._get_summary_model_context_limit(summary_model_id)
+            max_context_tokens = self._get_summary_model_context_limit(summary_model_id)
             request_limits = self._compute_summary_request_limits(max_context_tokens)
 
             await self._log(
@@ -2396,10 +2162,11 @@ class SummarizeMixin:
                     # 4. Calculate Tokens
                     token_count = self._calculate_messages_tokens(next_context)
 
-                    # 5. Resolve the active model's context window & calculate ratio
+                    # 5. Get Thresholds & Calculate Ratio
                     model = self._clean_model_id(body.get("model"))
-                    max_context_tokens = await self._get_model_max_context(
-                        model, (body.get("metadata") or {}).get("model")
+                    thresholds = self._get_model_thresholds(model)
+                    max_context_tokens = thresholds.get(
+                        "max_context_tokens", self.valves.max_context_tokens
                     )
                     # 6. Emit Status (only if threshold is met)
                     if max_context_tokens > 0:
@@ -2727,7 +2494,7 @@ Return only the XML working memory:
 
         await self._log(f"[🤖 LLM Call] Model: {model}", event_call=__event_call__)
 
-        max_context_tokens = await self._get_summary_model_context_limit(model)
+        max_context_tokens = self._get_summary_model_context_limit(model)
         request_limits = self._compute_summary_request_limits(max_context_tokens)
         max_output_tokens = request_limits["max_output_tokens"]
 
@@ -2882,8 +2649,9 @@ class ExternalRefsMixin:
             )
 
         model_id = self._clean_model_id(body.get("model"))
-        max_context_tokens = await self._get_model_max_context(
-            model_id, (body.get("metadata") or {}).get("model")
+        thresholds = self._get_model_thresholds(model_id) or {}
+        max_context_tokens = thresholds.get(
+            "max_context_tokens", self.valves.max_context_tokens
         )
         max_summary_tokens = self.valves.max_summary_tokens or 4096
         summary_model = (
@@ -2891,9 +2659,7 @@ class ExternalRefsMixin:
             or self._clean_model_id(body.get("model"))
             or "gpt-4o-mini"
         )
-        summary_model_max_context = await self._get_summary_model_context_limit(
-            summary_model
-        )
+        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
 
         base_messages = body.get("messages", [])
         base_message_tokens = self._estimate_messages_tokens(base_messages)
@@ -3121,9 +2887,7 @@ class ExternalRefsMixin:
 
         generated_summaries = []
         summary_model = self._clean_model_id(self.valves.summary_model) or "gpt-4o-mini"
-        summary_model_max_context = await self._get_summary_model_context_limit(
-            summary_model
-        )
+        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
 
         for referenced_chat in referenced_chats:
             if not isinstance(referenced_chat, dict):
@@ -3338,6 +3102,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         self._fallback_session_factory = (
             sessionmaker(bind=self._db_engine) if self._db_engine else None
         )
+        self._model_thresholds_cache: Optional[Dict[str, Any]] = None
 
         # Fallback mapping for variants not in TRANSLATIONS keys
         self.fallback_map = {
@@ -3349,28 +3114,25 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         # Concurrency control: Lock per chat session
         self._chat_locks = {}
         self._pending_inlet_messages: Dict[str, List[Dict[str, Any]]] = {}
-        # Cache of probed llama.cpp context sizes: cache_key -> (expires_at, n_ctx)
-        self._llamacpp_context_cache: Dict[str, Any] = {}
         self._init_database()
     class Valves(BaseModel):
         priority: int = Field(
             default=10, description="Priority level for the filter operations."
         )
         # Token related parameters
-        compression_threshold_percent: int = Field(
-            default=80,
+        compression_threshold_tokens: int = Field(
+            default=64000,
             ge=0,
-            le=100,
-            description="Trigger compression when the context reaches this percentage of the active model's max context window.",
+            description="When total context Token count exceeds this value, trigger compression (Global Default)",
         )
         max_context_tokens: int = Field(
             default=128000,
             ge=0,
-            description="Fallback max context window (tokens), used only when the active model does not declare a context_length in its metadata. Set to 0 for 'no limit'.",
+            description="Hard limit for context. Exceeding this value will force removal of earliest messages (Global Default)",
         )
-        enable_llamacpp_context_probe: bool = Field(
-            default=True,
-            description="Probe the llama.cpp server (GET /props, then /v1/models) to auto-detect the active model's context window when it is not declared in metadata.",
+        model_thresholds: str = Field(
+            default="",
+            description="Per-model threshold overrides. Format: model_id:compression_threshold:max_context (comma-separated). Example: gpt-4:8000:32000, claude-3:100000:200000",
         )
 
         keep_first: int = Field(
@@ -3383,12 +3145,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         )
         summary_model: Optional[str] = Field(
             default=None,
-            description="The model ID used to generate the summary. If empty, uses the current conversation's model.",
+            description="The model ID used to generate the summary. If empty, uses the current conversation's model. Used to match configurations in model_thresholds.",
         )
         summary_model_max_context: int = Field(
             default=0,
             ge=0,
-            description="Max context tokens for the summary model. If 0, resolves the summary model's own context_length (falling back to max_context_tokens).",
+            description="Max context tokens for the summary model. If 0, falls back to model_thresholds or global max_context_tokens. Example: gemini-flash=1000000, gpt-4o-mini=128000.",
         )
         max_summary_tokens: int = Field(
             default=16384,
@@ -3500,12 +3262,6 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
 
         chat_ctx = self._get_chat_context(body, __metadata__)
         chat_id = chat_ctx["chat_id"]
-
-        # Transient inlet messages are only consumed by this same turn's outlet.
-        # Drop any leftover from a previous turn whose outlet never ran (e.g. the
-        # request was cancelled), so the map can't accumulate stale entries.
-        if chat_id:
-            self._pending_inlet_messages.pop(chat_id, None)
 
         body = await self._handle_external_chat_references(
             body,
@@ -3663,19 +3419,32 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 event_call=__event_call__,
             )
 
-            # Log the resolved adaptive context window for this model
-            resolved_model_id = self._clean_model_id(body.get("model"))
-            resolved_max_context = await self._get_model_max_context(
-                resolved_model_id, __model__
-            )
-            resolved_threshold = self._get_compression_threshold(resolved_max_context)
-            await self._log(
-                f"[Inlet] 📋 Adaptive config: model={resolved_model_id or 'unknown'} | "
-                f"max_context={resolved_max_context}t | "
-                f"compression_threshold={resolved_threshold}t "
-                f"({self.valves.compression_threshold_percent}%)",
-                event_call=__event_call__,
-            )
+            # Log custom model configurations
+            raw_config = self.valves.model_thresholds
+            parsed_configs = self._parse_model_thresholds()
+
+            if raw_config:
+                config_list = [
+                    f"{model}: {cfg['compression_threshold_tokens']}t/{cfg['max_context_tokens']}t"
+                    for model, cfg in parsed_configs.items()
+                ]
+
+                if config_list:
+                    await self._log(
+                        f"[Inlet] 📋 Model Configs (Raw: '{raw_config}'): {', '.join(config_list)}",
+                        event_call=__event_call__,
+                    )
+                else:
+                    await self._log(
+                        f"[Inlet] ⚠️ Invalid Model Configs (Raw: '{raw_config}'): No valid configs parsed. Expected format: 'model_id:threshold:max_context'",
+                        log_type="warning",
+                        event_call=__event_call__,
+                    )
+            else:
+                await self._log(
+                    f"[Inlet] 📋 Model Configs: No custom configuration (Global defaults only)",
+                    event_call=__event_call__,
+                )
 
         # Log the aligned compression boundary using the same original-history
         # coordinate mapping as outlet/async summary generation.
@@ -3769,9 +3538,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 if not is_in_head:
                     calc_messages = [system_prompt_msg] + candidate_messages
 
-            # Get max context limit (adaptive to the active model)
+            # Get max context limit
             model = self._clean_model_id(body.get("model"))
-            max_context_tokens = await self._get_model_max_context(model, __model__)
+            thresholds = self._get_model_thresholds(model)
+            max_context_tokens = thresholds.get(
+                "max_context_tokens", self.valves.max_context_tokens
+            )
 
             # --- Fast Estimation Check ---
             estimated_tokens = self._estimate_messages_tokens(calc_messages)
@@ -3990,9 +3762,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 if not is_in_messages:
                     calc_messages = [system_prompt_msg] + candidate_messages
 
-            # Get max context limit (adaptive to the active model)
+            # Get max context limit
             model = self._clean_model_id(body.get("model"))
-            max_context_tokens = await self._get_model_max_context(model, __model__)
+            thresholds = self._get_model_thresholds(model) or {}
+            max_context_tokens = thresholds.get(
+                "max_context_tokens", self.valves.max_context_tokens
+            )
 
             # --- Fast Estimation Check ---
             estimated_tokens = self._estimate_messages_tokens(calc_messages)

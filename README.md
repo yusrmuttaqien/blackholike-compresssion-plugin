@@ -212,6 +212,8 @@ The plugin reports compression stats and progress as status lines above the assi
 
 The usage lines are controlled by the existing valves: `show_token_usage_status` toggles them and `token_usage_status_threshold` sets the usage percentage at which they appear (0 = always). The stage shimmers are always shown while a summary is being generated.
 
+The `X / max (Y%)` figure and the `Compression at N Tokens` threshold are measured on the same basis: the **sent context** — the messages actually sent to the model, plus any separately-injected system prompt. The inlet records both the exact sent-context count and the sent-context list it counted; the outlet's background recompute (and the compression trigger) reuse that same list rather than recounting the raw message list. This keeps the displayed usage, the `since last summary` growth, and the trigger all on one scale, so the percentage is a faithful read of how close the conversation is to the compaction threshold. (The model's own system prompt is included in the figure when it is injected separately, since it occupies the model's window.)
+
 ## 💾 Storage
 
 This filter uses Open WebUI's shared database connection for persistent storage. It automatically reuses Open WebUI's internal SQLAlchemy engine and `SessionLocal`, making the plugin database-agnostic and ensuring compatibility with any database backend that Open WebUI supports (PostgreSQL, SQLite, etc.).

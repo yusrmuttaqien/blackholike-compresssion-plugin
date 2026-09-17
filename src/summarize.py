@@ -415,6 +415,9 @@ class SummarizeMixin:
                     max_context_tokens = await self._get_model_max_context(
                         model, (body.get("metadata") or {}).get("model")
                     )
+                    compression_threshold_tokens = (
+                        self._get_compression_threshold(max_context_tokens)
+                    )
                     # 6. Emit Status (only if threshold is met)
                     if max_context_tokens > 0:
                         usage_ratio = token_count / max_context_tokens
@@ -426,6 +429,7 @@ class SummarizeMixin:
                                 tokens=token_count,
                                 max_tokens=max_context_tokens,
                                 ratio=f"{usage_ratio*100:.1f}",
+                                threshold=compression_threshold_tokens,
                             )
                             if (
                                 pre_compression_tokens

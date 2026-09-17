@@ -446,6 +446,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             # Get max context limit (adaptive to the active model)
             model = self._clean_model_id(body.get("model"))
             max_context_tokens = await self._get_model_max_context(model, __model__)
+            compression_threshold_tokens = self._get_compression_threshold(
+                max_context_tokens
+            )
 
             # --- Fast Estimation Check ---
             estimated_tokens = self._estimate_messages_tokens(calc_messages)
@@ -577,6 +580,21 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 event_call=__event_call__,
             )
 
+            # Record the exact sent-context size for the outlet trigger metric.
+            # Also pass the exact sent-context list (post-reduction messages +
+            # injected system prompt) so the outlet recomputes on the same
+            # basis as the inlet — the basis the trigger actually tests.
+            sent_context_messages = candidate_messages
+            if system_prompt_msg and not any(
+                m.get("role") == "system" for m in head_messages
+            ):
+                sent_context_messages = [system_prompt_msg] + candidate_messages
+            body["__sent_context_tokens__"] = total_section_tokens
+            body["__sent_context_tokens_estimated__"] = (
+                total_tokens == estimated_tokens
+            )
+            body["__sent_context_messages__"] = sent_context_messages
+
             # Prepare status message (Context Usage format)
             if max_context_tokens > 0:
                 usage_ratio = total_section_tokens / max_context_tokens
@@ -588,6 +606,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                         tokens=total_section_tokens,
                         max_tokens=max_context_tokens,
                         ratio=f"{usage_ratio*100:.1f}",
+                        threshold=compression_threshold_tokens,
                     )
                     if usage_ratio > 0.9:
                         status_msg += self._get_translation(lang, "status_high_usage")
@@ -667,6 +686,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             # Get max context limit (adaptive to the active model)
             model = self._clean_model_id(body.get("model"))
             max_context_tokens = await self._get_model_max_context(model, __model__)
+            compression_threshold_tokens = self._get_compression_threshold(
+                max_context_tokens
+            )
 
             # --- Fast Estimation Check ---
             estimated_tokens = self._estimate_messages_tokens(calc_messages)
@@ -752,6 +774,21 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                     event_call=__event_call__,
                 )
 
+            # Record the exact sent-context size for the outlet trigger metric.
+            # Also pass the exact sent-context list (post-reduction messages +
+            # injected system prompt) so the outlet recomputes on the same
+            # basis as the inlet — the basis the trigger actually tests.
+            sent_context_messages = candidate_messages
+            if system_prompt_msg and not any(
+                m.get("role") == "system" for m in candidate_messages
+            ):
+                sent_context_messages = [system_prompt_msg] + candidate_messages
+            body["__sent_context_tokens__"] = total_tokens
+            body["__sent_context_tokens_estimated__"] = (
+                total_tokens == estimated_tokens
+            )
+            body["__sent_context_messages__"] = sent_context_messages
+
             # Send status notification (Context Usage format)
             if max_context_tokens > 0:
                 usage_ratio = total_tokens / max_context_tokens
@@ -763,6 +800,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                         tokens=total_tokens,
                         max_tokens=max_context_tokens,
                         ratio=f"{usage_ratio*100:.1f}",
+                        threshold=compression_threshold_tokens,
                     )
                     if usage_ratio > 0.9:
                         status_msg += self._get_translation(lang, "status_high_usage")

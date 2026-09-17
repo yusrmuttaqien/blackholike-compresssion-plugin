@@ -783,66 +783,106 @@ class CompressionMixin:
                 max_context_tokens
             )
 
-            await self._log(
-                "\n[🔍 Background Calculation] Starting full-history token count...",
-                event_call=__event_call__,
+            # --- Sent-context metric ---
+            # The compression trigger is measured against the reconstructed
+            # context the inlet actually sent to the LLM (head + summary +
+            # preserved system + tail), not the raw full history. The inlet
+            # passes its exact sent-context count through the body; fall back
+            # to counting the outlet's view list when the key is absent.
+            sent_tokens = body.get("__sent_context_tokens__")
+            sent_tokens_estimated = bool(
+                body.get("__sent_context_tokens_estimated__", False)
+            )
+            sent_tokens_source = "inlet"
+            if sent_tokens is None:
+                sent_tokens = self._estimate_messages_tokens(messages)
+                sent_tokens_estimated = True
+                sent_tokens_source = "outlet"
+
+            # Recompute on the exact sent-context list the inlet counted
+            # (messages + injected system prompt), so the trigger and the
+            # displayed usage are on the same basis. Fall back to the raw
+            # view list if the inlet did not pass it through.
+            sent_context_messages = (
+                body.get("__sent_context_messages__") or messages
             )
 
-            # --- Fast Estimation Check ---
-            estimated_tokens = self._estimate_messages_tokens(messages)
+            await self._log(
+                "\n[🔍 Background Calculation] Sent-context token count...",
+                event_call=__event_call__,
+            )
 
             # For triggering summary generation, we need to be more precise if we are in the grey zone
             # Margin is 15% (skip tiktoken if estimated is < 85% of threshold)
             # Note: We still use tiktoken if we exceed threshold, because we want an accurate usage status report
-            if estimated_tokens < compression_threshold_tokens * 0.85:
-                current_tokens = estimated_tokens
+            if (
+                sent_tokens_estimated
+                and compression_threshold_tokens > 0
+                and sent_tokens >= compression_threshold_tokens * 0.85
+            ):
+                estimate_before_recheck = sent_tokens
+                sent_tokens = await asyncio.to_thread(
+                    self._calculate_messages_tokens, sent_context_messages
+                )
+                sent_tokens_estimated = False
+                delta = sent_tokens - estimate_before_recheck
+                delta_pct = (
+                    delta / estimate_before_recheck * 100
+                    if estimate_before_recheck
+                    else 0.0
+                )
                 await self._log(
-                    "[🔍 Background Calculation] Full-history estimate below threshold\n"
-                    f"source_history_tokens_est={current_tokens} | compression_threshold_tokens={compression_threshold_tokens} | precise_count_skipped=true",
+                    "[🔍 Background Calculation] Grey-zone recheck (estimate vs precise)\n"
+                    f"estimate_source={sent_tokens_source} | estimate={estimate_before_recheck} | "
+                    f"precise={sent_tokens} | delta={delta:+d} ({delta_pct:+.1f}%) | "
+                    f"compression_threshold_tokens={compression_threshold_tokens}",
                     event_call=__event_call__,
                 )
-            else:
-                # Calculate Token count precisely in a background thread
-                current_tokens = await asyncio.to_thread(
-                    self._calculate_messages_tokens, messages
-                )
-                await self._log(
-                    "[🔍 Background Calculation] Full-history precise token count\n"
-                    f"source_history_tokens={current_tokens}",
-                    event_call=__event_call__,
-                )
+
+            await self._log(
+                "[🔍 Background Calculation] Sent-context token count\n"
+                f"sent_context_tokens={sent_tokens} "
+                f"({'estimated' if sent_tokens_estimated else 'precise'}) | "
+                f"compression_threshold_tokens={compression_threshold_tokens}",
+                event_call=__event_call__,
+            )
 
             # Send status notification (Context Usage format)
             if __event_emitter__:
                 if max_context_tokens > 0:
-                    usage_ratio = current_tokens / max_context_tokens
+                    usage_ratio = sent_tokens / max_context_tokens
                     # Only show status if threshold is met
                     if self._should_show_status(usage_ratio):
                         status_msg = self._get_translation(
                             lang,
                             "status_context_usage",
-                            tokens=current_tokens,
+                            tokens=sent_tokens,
                             max_tokens=max_context_tokens,
                             ratio=f"{usage_ratio*100:.1f}",
+                            threshold=compression_threshold_tokens,
                         )
                         # Show how much the chat has grown since the last summary,
                         # if one exists (best-effort; keep the base line on error).
+                        # The summary marker message separates the summarized
+                        # head from the retained tail in the sent view.
                         try:
-                            summary_record = await self._load_summary_record(chat_id)
-                            prev_count = (
-                                summary_record.compressed_message_count or 0
-                                if summary_record
-                                else 0
-                            )
-                            if 0 < prev_count < len(messages):
+                            summary_index = None
+                            for i, m in enumerate(messages):
+                                if self._is_summary_message(m):
+                                    summary_index = i
+                                    break
+                            if (
+                                summary_index is not None
+                                and summary_index < len(messages)
+                            ):
                                 since_tokens = self._estimate_messages_tokens(
-                                    messages[prev_count:]
+                                    messages[summary_index + 1 :]
                                 )
                                 status_msg += self._get_translation(
                                     lang,
                                     "status_since_last_summary",
                                     tokens=since_tokens,
-                                    messages=len(messages) - prev_count,
+                                    messages=len(messages) - summary_index - 1,
                                 )
                         except Exception:
                             pass
@@ -863,10 +903,10 @@ class CompressionMixin:
                         )
 
             # Check if compression is needed
-            if compression_threshold_tokens > 0 and current_tokens >= compression_threshold_tokens:
+            if compression_threshold_tokens > 0 and sent_tokens >= compression_threshold_tokens:
                 await self._log(
-                    "[🔍 Background Calculation] ⚡ Full-history threshold triggered\n"
-                    f"source_history_tokens={current_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
+                    "[🔍 Background Calculation] ⚡ Sent-context threshold triggered\n"
+                    f"sent_context_tokens={sent_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
                     event_call=__event_call__,
                 )
 
@@ -881,12 +921,12 @@ class CompressionMixin:
                     __event_emitter__,
                     __event_call__,
                     __request__,
-                    pre_compression_tokens=current_tokens,
+                    pre_compression_tokens=sent_tokens,
                 )
             else:
                 await self._log(
-                    "[🔍 Background Calculation] Full-history threshold not reached\n"
-                    f"source_history_tokens={current_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
+                    "[🔍 Background Calculation] Sent-context threshold not reached\n"
+                    f"sent_context_tokens={sent_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
                     event_call=__event_call__,
                 )
 

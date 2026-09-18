@@ -61,3 +61,4 @@ Edits go in `src/`, then `python build.py` regenerates `v1.6.1.py`.
 
 - v1: initial lean pass (items 1–19).
 - v2: full flow analysis (`flows.md`) confirmed all v1 findings and added items 20–21 (dead `_trim_native_tool_outputs` return values / debug-stats machinery; dead `message_source` in outlet) and extended item 17 with `_pending_inlet_messages` unbounded growth.
+- v3: items 1–21 applied (Phases 1–3, see `todo.md`), plus **item 22 (structural)**: `inlet` (627 lines) and `_generate_summary_async` (408 lines) were the two flow-following bottlenecks — split into 6 verbatim-extracted helpers (3 in `src/filter.py`, 3 in `src/summarize.py`, Phase 4). `flows.md` rewritten line-number-free (method + fragment references).

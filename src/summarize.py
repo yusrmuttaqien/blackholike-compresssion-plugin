@@ -14,6 +14,349 @@ class SummarizeMixin:
         cleaned = model_id.strip().strip('"').strip("'")
         return cleaned if cleaned else None
 
+    async def _resolve_summary_boundary(
+        self,
+        messages: list,
+        target_compressed_count: Optional[int],
+        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve the visible message range that maps to the next
+        original-history compression boundary.
+
+        Returns a dict with middle_messages, summary_index, base_progress,
+        protected_prefix, start_index — or None when there is nothing to
+        compress.
+        """
+        # 1. Get target compression progress in original-history coordinates.
+        if target_compressed_count is None:
+            target_compressed_count = self._calculate_target_compressed_count(
+                messages
+            )
+            await self._log(
+                f"[🤖 Async Summary Task] ⚠️ target_compressed_count is None, estimating: {target_compressed_count}",
+                log_type="warning",
+                event_call=__event_call__,
+            )
+
+        # 2. Determine the visible message range that maps to the target original
+        # compression progress.
+        summary_state = self._get_summary_view_state(messages)
+        summary_index = summary_state["summary_index"]
+        base_progress = summary_state["base_progress"] or 0
+
+        if summary_index is None:
+            start_index = self._get_effective_keep_first(messages)
+            end_index = min(len(messages), target_compressed_count)
+            protected_prefix = 0
+        else:
+            start_index = summary_index
+            end_index = min(
+                len(messages),
+                summary_index + 1 + max(0, target_compressed_count - base_progress),
+            )
+            protected_prefix = 1
+
+        # Ensure indices are valid
+        if start_index >= end_index:
+            await self._log(
+                f"[🤖 Async Summary Task] Middle messages empty (Start: {start_index}, End: {end_index}), skipping\n"
+                f"  summary_index={summary_index} | base_progress={base_progress} | "
+                f"target_compressed_count={target_compressed_count} | "
+                f"keep_first={self.valves.keep_first} | keep_last={self.valves.keep_last} | "
+                f"total_messages={len(messages)}",
+                log_type="warning",
+                event_call=__event_call__,
+            )
+            return None
+
+        middle_messages = messages[start_index:end_index]
+        tail_preview_msgs = messages[end_index:]
+
+        if self.valves.show_debug_log and __event_call__:
+            middle_preview = [
+                f"{i + start_index}: [{m.get('role')}] {m.get('content', '')[:20]}..."
+                for i, m in enumerate(middle_messages[:3])
+            ]
+            tail_preview = [
+                f"{i + end_index}: [{m.get('role')}] {m.get('content', '')[:20]}..."
+                for i, m in enumerate(tail_preview_msgs)
+            ]
+            await self._log(
+                f"[🤖 Async Summary Task] 📊 Boundary Check:\n"
+                f"  - Middle (Compressing): {len(middle_messages)} msgs (Indices {start_index}-{end_index-1}) -> Preview: {middle_preview}\n"
+                f"  - Tail (Keeping): {len(tail_preview_msgs)} msgs (Indices {end_index}-End) -> Preview: {tail_preview}",
+                event_call=__event_call__,
+            )
+
+        return {
+            "middle_messages": middle_messages,
+            "summary_index": summary_index,
+            "base_progress": base_progress,
+            "protected_prefix": protected_prefix,
+            "start_index": start_index,
+        }
+
+    async def _fit_summary_request(
+        self,
+        body: dict,
+        chat_id: str,
+        summary_index: Optional[int],
+        middle_messages: list,
+        protected_prefix: int,
+        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fit the summary request within the summary model's budget.
+
+        Resolves the summary model and request limits, loads a
+        DB-backed previous summary when one is not already in the
+        messages, and shrinks the newest atomic groups until the
+        fitted prompt fits.
+
+        Returns a dict with middle_messages, previous_summary,
+        protected_prefix, prompt_tokens, summary_model_id,
+        max_context_tokens, request_limits — or None when there is
+        nothing to summarize.
+        """
+        # 3. Check Token limit and truncate (Max Context Truncation)
+        # [Optimization] Use the summary model's (if any) threshold to decide how many middle messages can be processed
+        # This allows using a long-window model (like gemini-flash) to compress history exceeding the current model's window
+        summary_model_id = self._clean_model_id(
+            self.valves.summary_model
+        ) or self._clean_model_id(body.get("model"))
+
+        if not summary_model_id:
+            await self._log(
+                "[🤖 Async Summary Task] ⚠️ Summary model does not exist, skipping compression",
+                log_type="warning",
+                event_call=__event_call__,
+            )
+            return None
+
+        max_context_tokens = self._get_summary_model_context_limit(summary_model_id)
+        request_limits = self._compute_summary_request_limits(max_context_tokens)
+
+        await self._log(
+            f"[🤖 Async Summary Task] Using max limit for model {summary_model_id}: {max_context_tokens} Tokens",
+            event_call=__event_call__,
+        )
+        if max_context_tokens > 0:
+            await self._log(
+                "[🤖 Async Summary Task] Summary request budget: "
+                f"input<={request_limits['max_input_tokens']}t | "
+                f"output<={request_limits['max_output_tokens']}t | "
+                f"safety={request_limits['safety_margin_tokens']}t",
+                event_call=__event_call__,
+            )
+
+        # Determine previous_summary to pass to LLM before final prompt budgeting.
+        # When summary_index is not None, the old summary message is already the first
+        # entry of middle_messages (protected_prefix=1), so it appears verbatim in
+        # conversation_text — no need to inject separately.
+        # When summary_index is None the outlet messages come from raw DB history that
+        # has never had the summary injected, so we must load it from DB explicitly.
+        if summary_index is None:
+            previous_summary = await self._load_summary(chat_id)
+            if previous_summary:
+                await self._log(
+                    "[🤖 Async Summary Task] Loaded previous summary from DB to pass as context (summary not in messages)",
+                    event_call=__event_call__,
+                )
+        else:
+            previous_summary = None
+
+        if max_context_tokens <= 0:
+            await self._log(
+                "[🤖 Async Summary Task] No max_context_tokens limit set (0). Skipping final request budgeting.",
+                event_call=__event_call__,
+            )
+        # Fit the exact final request prompt, not just middle-message heuristics.
+        prompt_tokens = 0
+        while max_context_tokens > 0:
+            if not middle_messages:
+                await self._log(
+                    "[🤖 Async Summary Task] Middle messages empty after final request shrink, skipping summary generation",
+                    event_call=__event_call__,
+                )
+            return None
+
+            conversation_text = self._format_messages_for_summary(middle_messages)
+            summary_prompt = self._build_summary_prompt(
+                conversation_text, previous_summary=previous_summary
+            )
+            prompt_tokens = await asyncio.to_thread(
+                self._count_tokens, summary_prompt
+            )
+
+            if prompt_tokens <= request_limits["max_input_tokens"]:
+                break
+
+            overflow_tokens = prompt_tokens - request_limits["max_input_tokens"]
+            await self._log(
+                f"[🤖 Async Summary Task] ⚠️ Final summary request input ({prompt_tokens} Tokens) exceeds safe budget ({request_limits['max_input_tokens']}), shrinking by at least {overflow_tokens} Tokens",
+                log_type="warning",
+                event_call=__event_call__,
+            )
+
+            trimmable_middle = middle_messages[protected_prefix:]
+            summary_atomic_groups = self._get_atomic_groups(trimmable_middle)
+            if len(summary_atomic_groups) > 1:
+                group_indices = summary_atomic_groups.pop()
+                removed_count = len(group_indices)
+                removed_preview_tokens = sum(
+                    self._estimate_content_tokens(
+                        trimmable_middle[-offset].get("content", "")
+                    )
+                    for offset in range(1, removed_count + 1)
+                )
+                for _ in range(removed_count):
+                    trimmable_middle.pop()
+                middle_messages = (
+                    middle_messages[:protected_prefix] + trimmable_middle
+                )
+                await self._log(
+                    f"[🤖 Async Summary Task] Removed newest atomic group ({removed_count} msgs, est {removed_preview_tokens} Tokens) to fit final request payload",
+                    event_call=__event_call__,
+                )
+                continue
+
+            if protected_prefix > 0:
+                middle_messages = middle_messages[1:]
+                protected_prefix = 0
+                await self._log(
+                    "[🤖 Async Summary Task] Dropped embedded previous summary marker from compression input to fit final request payload",
+                    log_type="warning",
+                    event_call=__event_call__,
+                )
+                continue
+
+            if previous_summary:
+                previous_summary = None
+                await self._log(
+                    "[🤖 Async Summary Task] Dropped DB-backed previous summary from prompt to fit final request payload",
+                    log_type="warning",
+                    event_call=__event_call__,
+                )
+                continue
+
+            await self._log(
+                "[🤖 Async Summary Task] Unable to fit final summary request within model budget after shrinking. Skipping summary generation.",
+                log_type="error",
+                event_call=__event_call__,
+            )
+            return None
+
+        if not middle_messages:
+            await self._log(
+                "[🤖 Async Summary Task] Middle messages empty after truncation, skipping summary generation",
+                event_call=__event_call__,
+            )
+            return None
+
+        return {
+            "middle_messages": middle_messages,
+            "previous_summary": previous_summary,
+            "protected_prefix": protected_prefix,
+            "prompt_tokens": prompt_tokens,
+            "summary_model_id": summary_model_id,
+            "max_context_tokens": max_context_tokens,
+            "request_limits": request_limits,
+        }
+
+    async def _emit_post_summary_usage_status(
+        self,
+        messages: list,
+        body: dict,
+        new_summary: str,
+        saved_compressed_count: int,
+        summary_index: Optional[int],
+        base_progress: int,
+        lang: str,
+        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> None:
+        """
+        Emit the post-summary context usage status, assembling the next
+        sent context (head + new summary message + tail) from the saved
+        original-history boundary.
+        """
+        # --- Token Usage Status Notification ---
+        if self.valves.show_token_usage_status and __event_emitter__:
+            try:
+                # 1. Fetch System Prompt (DB fallback)
+                system_prompt_msg = None
+                model_id = body.get("model")
+                if model_id:
+                    try:
+                        model_obj = await _call_db(Models.get_model_by_id, model_id)
+                        if model_obj and model_obj.params:
+                            sys_content = self._extract_system_from_params(
+                                model_obj.params
+                            )
+                            if sys_content:
+                                system_prompt_msg = {
+                                    "role": "system",
+                                    "content": sys_content,
+                                }
+                    except Exception:
+                        pass  # Ignore DB errors here, best effort
+
+                # 2. Construct Next Context using the saved original-history boundary.
+                next_summary_msg = self._build_summary_message(
+                    new_summary, lang, saved_compressed_count
+                )
+                if summary_index is None:
+                    effective_keep_first = self._get_effective_keep_first(messages)
+                    head_msgs = (
+                        messages[:effective_keep_first]
+                        if effective_keep_first > 0
+                        else []
+                    )
+                    visible_tail_start = max(
+                        saved_compressed_count, effective_keep_first
+                    )
+                else:
+                    head_msgs = messages[:summary_index]
+                    visible_tail_start = (
+                        summary_index
+                        + 1
+                        + max(0, saved_compressed_count - base_progress)
+                    )
+
+                tail_msgs = messages[visible_tail_start:]
+
+                # Assemble
+                next_context = head_msgs + [next_summary_msg] + tail_msgs
+
+                # Inject system prompt if needed
+                if system_prompt_msg:
+                    is_in_head = any(m.get("role") == "system" for m in head_msgs)
+                    if not is_in_head:
+                        next_context = [system_prompt_msg] + next_context
+
+                # 4. Calculate Tokens
+                token_count = await asyncio.to_thread(
+                    self._calculate_messages_tokens, next_context
+                )
+
+                # 5. Get Thresholds & Calculate Ratio
+                model = self._clean_model_id(body.get("model"))
+                thresholds = self._get_model_thresholds(model)
+                max_context_tokens = thresholds.get(
+                    "max_context_tokens", self.valves.max_context_tokens
+                )
+                # 6. Emit Status (only if threshold is met)
+                await self._emit_context_usage_status(
+                    token_count, max_context_tokens, lang, __event_emitter__
+                )
+            except Exception as e:
+                await self._log(
+                    f"[Status] Error calculating tokens: {e}",
+                    log_type="error",
+                    event_call=__event_call__,
+                )
+
     async def _generate_summary_async(
         self,
         messages: list,
@@ -38,203 +381,38 @@ class SummarizeMixin:
                 f"\n[🤖 Async Summary Task] Starting...", event_call=__event_call__
             )
 
-            # 1. Get target compression progress in original-history coordinates.
-            if target_compressed_count is None:
-                target_compressed_count = self._calculate_target_compressed_count(
-                    messages
-                )
-                await self._log(
-                    f"[🤖 Async Summary Task] ⚠️ target_compressed_count is None, estimating: {target_compressed_count}",
-                    log_type="warning",
-                    event_call=__event_call__,
-                )
-
-            # 2. Determine the visible message range that maps to the target original
-            # compression progress.
-            summary_state = self._get_summary_view_state(messages)
-            summary_index = summary_state["summary_index"]
-            base_progress = summary_state["base_progress"] or 0
-
-            if summary_index is None:
-                start_index = self._get_effective_keep_first(messages)
-                end_index = min(len(messages), target_compressed_count)
-                protected_prefix = 0
-            else:
-                start_index = summary_index
-                end_index = min(
-                    len(messages),
-                    summary_index + 1 + max(0, target_compressed_count - base_progress),
-                )
-                protected_prefix = 1
-
-            # Ensure indices are valid
-            if start_index >= end_index:
-                await self._log(
-                    f"[🤖 Async Summary Task] Middle messages empty (Start: {start_index}, End: {end_index}), skipping\n"
-                    f"  summary_index={summary_index} | base_progress={base_progress} | "
-                    f"target_compressed_count={target_compressed_count} | "
-                    f"keep_first={self.valves.keep_first} | keep_last={self.valves.keep_last} | "
-                    f"total_messages={len(messages)}",
-                    log_type="warning",
-                    event_call=__event_call__,
-                )
-                return
-
-            middle_messages = messages[start_index:end_index]
-            tail_preview_msgs = messages[end_index:]
-
-            if self.valves.show_debug_log and __event_call__:
-                middle_preview = [
-                    f"{i + start_index}: [{m.get('role')}] {m.get('content', '')[:20]}..."
-                    for i, m in enumerate(middle_messages[:3])
-                ]
-                tail_preview = [
-                    f"{i + end_index}: [{m.get('role')}] {m.get('content', '')[:20]}..."
-                    for i, m in enumerate(tail_preview_msgs)
-                ]
-                await self._log(
-                    f"[🤖 Async Summary Task] 📊 Boundary Check:\n"
-                    f"  - Middle (Compressing): {len(middle_messages)} msgs (Indices {start_index}-{end_index-1}) -> Preview: {middle_preview}\n"
-                    f"  - Tail (Keeping): {len(tail_preview_msgs)} msgs (Indices {end_index}-End) -> Preview: {tail_preview}",
-                    event_call=__event_call__,
-                )
-
-            # 3. Check Token limit and truncate (Max Context Truncation)
-            # [Optimization] Use the summary model's (if any) threshold to decide how many middle messages can be processed
-            # This allows using a long-window model (like gemini-flash) to compress history exceeding the current model's window
-            summary_model_id = self._clean_model_id(
-                self.valves.summary_model
-            ) or self._clean_model_id(body.get("model"))
-
-            if not summary_model_id:
-                await self._log(
-                    "[🤖 Async Summary Task] ⚠️ Summary model does not exist, skipping compression",
-                    log_type="warning",
-                    event_call=__event_call__,
-                )
-                return
-
-            max_context_tokens = self._get_summary_model_context_limit(summary_model_id)
-            request_limits = self._compute_summary_request_limits(max_context_tokens)
-
-            await self._log(
-                f"[🤖 Async Summary Task] Using max limit for model {summary_model_id}: {max_context_tokens} Tokens",
-                event_call=__event_call__,
+            # 1. Resolve the visible message range for the next summary
+            # boundary (original-history coordinates).
+            boundary = await self._resolve_summary_boundary(
+                messages, target_compressed_count, __event_call__
             )
-            if max_context_tokens > 0:
-                await self._log(
-                    "[🤖 Async Summary Task] Summary request budget: "
-                    f"input<={request_limits['max_input_tokens']}t | "
-                    f"output<={request_limits['max_output_tokens']}t | "
-                    f"safety={request_limits['safety_margin_tokens']}t",
-                    event_call=__event_call__,
-                )
-
-            # Determine previous_summary to pass to LLM before final prompt budgeting.
-            # When summary_index is not None, the old summary message is already the first
-            # entry of middle_messages (protected_prefix=1), so it appears verbatim in
-            # conversation_text — no need to inject separately.
-            # When summary_index is None the outlet messages come from raw DB history that
-            # has never had the summary injected, so we must load it from DB explicitly.
-            if summary_index is None:
-                previous_summary = await self._load_summary(chat_id)
-                if previous_summary:
-                    await self._log(
-                        "[🤖 Async Summary Task] Loaded previous summary from DB to pass as context (summary not in messages)",
-                        event_call=__event_call__,
-                    )
-            else:
-                previous_summary = None
-
-            if max_context_tokens <= 0:
-                await self._log(
-                    "[🤖 Async Summary Task] No max_context_tokens limit set (0). Skipping final request budgeting.",
-                    event_call=__event_call__,
-                )
-            # Fit the exact final request prompt, not just middle-message heuristics.
-            prompt_tokens = 0
-            while max_context_tokens > 0:
-                if not middle_messages:
-                    await self._log(
-                        "[🤖 Async Summary Task] Middle messages empty after final request shrink, skipping summary generation",
-                        event_call=__event_call__,
-                    )
-                    return
-
-                conversation_text = self._format_messages_for_summary(middle_messages)
-                summary_prompt = self._build_summary_prompt(
-                    conversation_text, previous_summary=previous_summary
-                )
-                prompt_tokens = await asyncio.to_thread(
-                    self._count_tokens, summary_prompt
-                )
-
-                if prompt_tokens <= request_limits["max_input_tokens"]:
-                    break
-
-                overflow_tokens = prompt_tokens - request_limits["max_input_tokens"]
-                await self._log(
-                    f"[🤖 Async Summary Task] ⚠️ Final summary request input ({prompt_tokens} Tokens) exceeds safe budget ({request_limits['max_input_tokens']}), shrinking by at least {overflow_tokens} Tokens",
-                    log_type="warning",
-                    event_call=__event_call__,
-                )
-
-                trimmable_middle = middle_messages[protected_prefix:]
-                summary_atomic_groups = self._get_atomic_groups(trimmable_middle)
-                if len(summary_atomic_groups) > 1:
-                    group_indices = summary_atomic_groups.pop()
-                    removed_count = len(group_indices)
-                    removed_preview_tokens = sum(
-                        self._estimate_content_tokens(
-                            trimmable_middle[-offset].get("content", "")
-                        )
-                        for offset in range(1, removed_count + 1)
-                    )
-                    for _ in range(removed_count):
-                        trimmable_middle.pop()
-                    middle_messages = (
-                        middle_messages[:protected_prefix] + trimmable_middle
-                    )
-                    await self._log(
-                        f"[🤖 Async Summary Task] Removed newest atomic group ({removed_count} msgs, est {removed_preview_tokens} Tokens) to fit final request payload",
-                        event_call=__event_call__,
-                    )
-                    continue
-
-                if protected_prefix > 0:
-                    middle_messages = middle_messages[1:]
-                    protected_prefix = 0
-                    await self._log(
-                        "[🤖 Async Summary Task] Dropped embedded previous summary marker from compression input to fit final request payload",
-                        log_type="warning",
-                        event_call=__event_call__,
-                    )
-                    continue
-
-                if previous_summary:
-                    previous_summary = None
-                    await self._log(
-                        "[🤖 Async Summary Task] Dropped DB-backed previous summary from prompt to fit final request payload",
-                        log_type="warning",
-                        event_call=__event_call__,
-                    )
-                    continue
-
-                await self._log(
-                    "[🤖 Async Summary Task] Unable to fit final summary request within model budget after shrinking. Skipping summary generation.",
-                    log_type="error",
-                    event_call=__event_call__,
-                )
+            if boundary is None:
                 return
+            middle_messages = boundary["middle_messages"]
+            summary_index = boundary["summary_index"]
+            base_progress = boundary["base_progress"]
+            protected_prefix = boundary["protected_prefix"]
+            start_index = boundary["start_index"]
 
-            if not middle_messages:
-                await self._log(
-                    "[🤖 Async Summary Task] Middle messages empty after truncation, skipping summary generation",
-                    event_call=__event_call__,
-                )
+            # 2. Fit the summary request within the summary model's budget.
+            fitted = await self._fit_summary_request(
+                body,
+                chat_id,
+                summary_index,
+                middle_messages,
+                protected_prefix,
+                __event_call__,
+            )
+            if fitted is None:
                 return
-
-            # 4. Build conversation text using the fitted request payload.
+            middle_messages = fitted["middle_messages"]
+            previous_summary = fitted["previous_summary"]
+            protected_prefix = fitted["protected_prefix"]
+            prompt_tokens = fitted["prompt_tokens"]
+            summary_model_id = fitted["summary_model_id"]
+            max_context_tokens = fitted["max_context_tokens"]
+            request_limits = fitted["request_limits"]
+            # 3. Build conversation text using the fitted request payload.
             conversation_text = self._format_messages_for_summary(middle_messages)
             if max_context_tokens > 0:
                 await self._log(
@@ -242,7 +420,7 @@ class SummarizeMixin:
                     event_call=__event_call__,
                 )
 
-            # 6. Call LLM to generate new summary
+            # 4. Call LLM to generate new summary
 
             # Send status notification for starting summary generation
             if __event_emitter__:
@@ -282,7 +460,7 @@ class SummarizeMixin:
                     0, len(middle_messages) - protected_prefix
                 )
 
-            # 6. Save new summary
+            # 5. Save new summary
             await self._log(
                 "[Optimization] Saving summary in a background thread to avoid blocking the event loop.",
                 event_call=__event_call__,
@@ -316,82 +494,18 @@ class SummarizeMixin:
                 event_call=__event_call__,
             )
 
-            # --- Token Usage Status Notification ---
-            if self.valves.show_token_usage_status and __event_emitter__:
-                try:
-                    # 1. Fetch System Prompt (DB fallback)
-                    system_prompt_msg = None
-                    model_id = body.get("model")
-                    if model_id:
-                        try:
-                            model_obj = await _call_db(Models.get_model_by_id, model_id)
-                            if model_obj and model_obj.params:
-                                sys_content = self._extract_system_from_params(
-                                    model_obj.params
-                                )
-                                if sys_content:
-                                    system_prompt_msg = {
-                                        "role": "system",
-                                        "content": sys_content,
-                                    }
-                        except Exception:
-                            pass  # Ignore DB errors here, best effort
-
-                    # 2. Construct Next Context using the saved original-history boundary.
-                    next_summary_msg = self._build_summary_message(
-                        new_summary, lang, saved_compressed_count
-                    )
-                    if summary_index is None:
-                        effective_keep_first = self._get_effective_keep_first(messages)
-                        head_msgs = (
-                            messages[:effective_keep_first]
-                            if effective_keep_first > 0
-                            else []
-                        )
-                        visible_tail_start = max(
-                            saved_compressed_count, effective_keep_first
-                        )
-                    else:
-                        head_msgs = messages[:summary_index]
-                        visible_tail_start = (
-                            summary_index
-                            + 1
-                            + max(0, saved_compressed_count - base_progress)
-                        )
-
-                    tail_msgs = messages[visible_tail_start:]
-
-                    # Assemble
-                    next_context = head_msgs + [next_summary_msg] + tail_msgs
-
-                    # Inject system prompt if needed
-                    if system_prompt_msg:
-                        is_in_head = any(m.get("role") == "system" for m in head_msgs)
-                        if not is_in_head:
-                            next_context = [system_prompt_msg] + next_context
-
-                    # 4. Calculate Tokens
-                    token_count = await asyncio.to_thread(
-                        self._calculate_messages_tokens, next_context
-                    )
-
-                    # 5. Get Thresholds & Calculate Ratio
-                    model = self._clean_model_id(body.get("model"))
-                    thresholds = self._get_model_thresholds(model)
-                    max_context_tokens = thresholds.get(
-                        "max_context_tokens", self.valves.max_context_tokens
-                    )
-                    # 6. Emit Status (only if threshold is met)
-                    await self._emit_context_usage_status(
-                        token_count, max_context_tokens, lang, __event_emitter__
-                    )
-                except Exception as e:
-                    await self._log(
-                        f"[Status] Error calculating tokens: {e}",
-                        log_type="error",
-                        event_call=__event_call__,
-                    )
-
+            # 6. Token usage status notification
+            await self._emit_post_summary_usage_status(
+                messages,
+                body,
+                new_summary,
+                saved_compressed_count,
+                summary_index,
+                base_progress,
+                lang,
+                __event_call__,
+                __event_emitter__,
+            )
         except Exception as e:
             await self._log(
                 f"[🤖 Async Summary Task] ❌ Error: {str(e)}",

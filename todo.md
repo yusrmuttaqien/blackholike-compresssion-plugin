@@ -100,7 +100,57 @@ Source of truth for findings: `assessment.md` (v2). Flow reference: `flows.md`.
 > **Phase 3 complete: 3,794 → 3,825 lines (+31 — defensive code added on purpose:**
 > shared-pool helper, bound checks, broadcast flag).** Verified: build +
 > py_compile OK, diff = exactly the 4 fixes, no stale patterns.
-> Net across all three phases: 4,036 → 3,825 lines (−211).
+> Net across phases 1–3: 4,036 → 3,825 lines (−211).
+
+---
+
+## Phase 4 — Structural splits (readability, behavior-preserving)
+
+`inlet` (627 lines) and `_generate_summary_async` (408 lines) were the two
+flow-following bottlenecks. Split into verbatim-extracted helpers:
+
+- [x] 4.1 `inlet` → 3 helpers in `src/filter.py`:
+      - `_extract_inlet_system_prompt(body, messages, __event_call__)` — DB →
+        messages system-prompt extraction + message-role stats log.
+      - `_assemble_summary_view(...)` — the with-summary branch
+        ([Head] + [Summary Message] + [Tail], budget fit, stats, status).
+      - `_assemble_plain_view(...)` — the no-summary branch (external-ref
+        injection, budget fit, status); returns `None` for empty history.
+      `inlet` is now ~210 lines and reads top-to-bottom.
+- [x] 4.2 `_generate_summary_async` → 3 helpers in `src/summarize.py`:
+      - `_resolve_summary_boundary(messages, target, __event_call__)` —
+        visible-range resolution for the next compression boundary.
+      - `_fit_summary_request(body, chat_id, summary_index, middle, protected_prefix, ...)`
+        — model/limits resolution, previous-summary load, atomic-shrink loop.
+      - `_emit_post_summary_usage_status(...)` — post-save next-context
+        token recompute + usage status.
+- [x] 4.3 Removed the duplicate `# Try to get from DB (custom model)` comment
+      left over in `src/filter.py` (Phase 1 leftover).
+- [x] 4.4 Docs updated: `flows.md` rewritten line-number-free (method + fragment
+      references), reflecting Phases 1–4; `assessment.md` update log v3.
+- [x] 4.5 Bugfix: re-add `external_refs_injected_count = 0` at the top of
+      `_assemble_summary_view` and `_assemble_plain_view`. The original
+      initializer lived in `inlet` *before* the branch and was deleted with
+      it, but the branches only assigned the variable conditionally (when
+      external refs exist) — so the common no-refs path raised
+      `UnboundLocalError`. Verified with a stubbed-import smoke test driving
+      both helpers' no-refs path.
+
+> **Phase 4 complete: 3,825 → 4,023 lines (+198 — helper signatures, docstrings,
+> and multi-line call wrapping; no logic added).** Verified: build + py_compile
+> OK, method-set diff = exactly 6 helpers added / 0 removed, every helper body
+> verified byte-identical to the original inline code (modulo indentation and
+> the intentional `return body` → `return None, ...` / bare-`return` →
+> `return None` conversions), all `self._*` calls resolve, one call site per
+> helper in the built file.
+>
+> **Net across all four phases: 4,036 → 4,027 lines (−9), plus the two largest
+> functions reduced from 627/408 lines to 210/178 lines of orchestration.**
+>
+> Note: 4.5 (initializers) added 4 lines. Full `inlet` smoke test (stubbed
+> open_webui/fastapi/DB, no-summary and with-summary branches) passes:
+> no-summary returns messages as-is; with-summary injects the summary as
+> the first assistant message.
 
 ---
 

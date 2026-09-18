@@ -104,93 +104,22 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             ge=1,
             description="Trim native tool outputs when their total content length reaches this many characters.",
         )
-    async def inlet(
+    async def _extract_inlet_system_prompt(
         self,
         body: dict,
-        __user__: Optional[dict] = None,
-        __metadata__: dict = None,
-        __request__: Request = None,
-        __model__: dict = None,
-        __event_emitter__: Callable[[Any], Awaitable[None]] = None,
-        __event_call__: Callable[[Any], Awaitable[None]] = None,
-    ) -> dict:
+        messages: List[Dict],
+        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> Optional[Dict[str, str]]:
         """
-        Executed before sending to the LLM.
-        Compression Strategy: Only responsible for injecting existing summaries, no Token calculation.
+        Extract the system prompt for accurate token calculation.
+
+        1. For custom models: check DB (Models.get_model_by_id)
+        2. For base models: check messages for role='system'
+
+        Returns a system message dict for budget calculation, or None.
         """
-
-        if self._should_skip_compression(body):
-            if self.valves.debug_mode:
-                logger.info(
-                    "[Inlet] Skipping compression: copilot_sdk detected in base model"
-                )
-            return body
-
-        messages = body.get("messages", [])
-        user_ctx = await self._get_user_context(__user__, __event_call__)
-        lang = user_ctx["user_language"]
-
-        normalized_tool_call_count = self._normalize_native_tool_call_ids(messages)
-        if (
-            normalized_tool_call_count > 0
-            and self.valves.show_debug_log
-            and __event_call__
-        ):
-            await self._log(
-                f"[Inlet] 🪪 Normalized {normalized_tool_call_count} overlong tool call ID(s).",
-                event_call=__event_call__,
-            )
-
-        # --- Native Tool Output Trimming (Opt-in, only for native function calling) ---
-        function_calling_mode = self._get_function_calling_mode(body)
-        is_native_func_calling = function_calling_mode == "native"
-
-        if self.valves.show_debug_log and __event_call__:
-            trimming_state = (
-                "enabled" if self.valves.enable_tool_output_trimming else "disabled"
-            )
-            await self._log(
-                "[Inlet] ✂️ Tool trimming check: "
-                f"state={trimming_state}, function_calling={function_calling_mode or 'unset'}, "
-                f"message_count={len(messages)}",
-                event_call=__event_call__,
-            )
-
-        if self.valves.enable_tool_output_trimming and is_native_func_calling:
-            trimmed_count = self._trim_native_tool_outputs(messages, lang)
-            if self.valves.show_debug_log and __event_call__:
-                await self._log(
-                    f"[Inlet] ✂️ Tool trimming: {trimmed_count} tool output(s) trimmed.",
-                    event_call=__event_call__,
-                )
-        elif self.valves.show_debug_log and __event_call__:
-            skip_reason = (
-                "tool trimming disabled"
-                if not self.valves.enable_tool_output_trimming
-                else f"function_calling={function_calling_mode or 'unset'}"
-            )
-            await self._log(
-                f"[Inlet] ✂️ Tool trimming skipped: {skip_reason}.",
-                event_call=__event_call__,
-            )
-
-        chat_ctx = self._get_chat_context(body, __metadata__)
-        chat_id = chat_ctx["chat_id"]
-
-        body = await self._handle_external_chat_references(
-            body,
-            user_data=__user__,
-            __event_call__=__event_call__,
-            __request__=__request__,
-        )
-        messages = body.get("messages", [])
-
-        # Extract system prompt for accurate token calculation
-        # 1. For custom models: check DB (Models.get_model_by_id)
-        # 2. For base models: check messages for role='system'
         system_prompt_content = None
 
-        # Try to get from DB (custom model)
         # Try to get from DB (custom model)
         try:
             model_id = body.get("model")
@@ -305,6 +234,466 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             except Exception as e:
                 logger.error(f"[Inlet] Error logging message stats: {e}")
 
+        return system_prompt_msg
+
+    async def _assemble_summary_view(
+        self,
+        body: dict,
+        messages: List[Dict],
+        summary_record,
+        lang: str,
+        effective_keep_first: int,
+        system_prompt_msg: Optional[Dict[str, str]],
+        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> tuple:
+        """
+        Build the [Head] + [Summary Message] + [Tail] view for a chat that
+        already has a stored summary, fit it to the context budget, and
+        emit the sent-context stats and status.
+
+        Returns (final_messages, external_refs_injected_count).
+        """
+        external_refs_injected_count = 0
+
+        # Summary exists, build view: [Head] + [Summary Message] + [Tail]
+        # Tail is all messages after the last compression point
+        compressed_count = summary_record.compressed_message_count
+
+        # Ensure compressed_count is reasonable
+        if compressed_count > len(messages):
+            compressed_count = max(0, len(messages) - self.valves.keep_last)
+
+        # 1. Head messages (Keep First)
+        head_messages = []
+        if effective_keep_first > 0:
+            head_messages = messages[:effective_keep_first]
+
+        # 2. Tail messages (Tail) - All messages starting from the last compression point.
+        # Align legacy/raw progress to an atomic boundary so old summary rows do not
+        # reintroduce orphaned tool messages into the retained tail.
+        raw_start_index = max(compressed_count, effective_keep_first)
+        start_index = self._align_tail_start_to_atomic_boundary(
+            messages, raw_start_index, effective_keep_first
+        )
+
+        # --- Extract Preserved System Messages from the Gap ---
+        # Any system message in the gap (messages[effective_keep_first:start_index])
+        # must be preserved according to policy.
+        gap_messages = messages[effective_keep_first:start_index]
+        preserved_system_messages = [
+            msg
+            for msg in gap_messages
+            if isinstance(msg, dict) and msg.get("role") == "system"
+        ]
+
+        # 3. Summary message (Inserted as Assistant message)
+        external_refs = body.pop("__external_references__", None)
+        summary_msg = self._build_summary_message(
+            summary_record.summary,
+            lang,
+            start_index,
+        )
+
+        if external_refs:
+            external_content = external_refs.get("content", "")
+            if external_content:
+                external_refs_injected_count = len(
+                    external_refs.get("references", [])
+                )
+                summary_msg["content"] = (
+                    f"<external_references>\n{external_content}\n</external_references>\n\n"
+                    + summary_msg["content"]
+                )
+                summary_msg["metadata"]["external_references"] = external_refs.get(
+                    "references", []
+                )
+
+        tail_messages = messages[start_index:]
+
+        # --- Preflight Check & Budgeting (Simplified) ---
+
+        # Assemble candidate messages (for output)
+        candidate_messages = (
+            head_messages
+            + [summary_msg]
+            + preserved_system_messages
+            + tail_messages
+        )
+
+        # Prepare messages for token calculation (include system prompt if missing)
+        calc_messages = candidate_messages
+        if system_prompt_msg:
+            # Check if system prompt is already in head_messages
+            is_in_head = any(m.get("role") == "system" for m in head_messages)
+            if not is_in_head:
+                calc_messages = [system_prompt_msg] + candidate_messages
+
+        # Get max context limit
+        model = self._clean_model_id(body.get("model"))
+        thresholds = self._get_model_thresholds(model)
+        max_context_tokens = thresholds.get(
+            "max_context_tokens", self.valves.max_context_tokens
+        )
+
+        # --- Fast Estimation Check ---
+        # Since this is a hard limit check, only skip precise calculation if we are far below it (margin of 15%)
+        # max_context_tokens == 0 means "no limit", skip reduction entirely
+        total_tokens, estimated_tokens, used_precise = (
+            await self._resolve_context_tokens(calc_messages, max_context_tokens)
+        )
+        if max_context_tokens <= 0:
+            await self._log(
+                f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
+                event_call=__event_call__,
+            )
+        elif not used_precise:
+            await self._log(
+                "[Inlet] 🔎 Sent-context preflight (estimated)\n"
+                f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | status=well_within_limit",
+                event_call=__event_call__,
+            )
+        else:
+            # Preflight Check Log
+            await self._log(
+                "[Inlet] 🔎 Sent-context preflight (precise)\n"
+                f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | usage={(total_tokens/max_context_tokens*100):.1f}%",
+                event_call=__event_call__,
+            )
+
+            # Identify atomic groups to avoid breaking tool-calling context
+            atomic_groups = self._get_atomic_groups(tail_messages)
+
+            while total_tokens > max_context_tokens and len(atomic_groups) > 1:
+                # Drop the oldest atomic group entirely (never cut through a
+                # tool-calling block).
+                dropped_group_indices = atomic_groups.pop(0)
+                dropped_tokens = self._drop_oldest_atomic_group(
+                    tail_messages,
+                    dropped_group_indices,
+                    used_precise,
+                    preserve_protected=False,
+                    preserved_systems=None,
+                )
+                total_tokens -= dropped_tokens
+
+                if self.valves.show_debug_log and __event_call__:
+                    await self._log(
+                        f"[Inlet] 🗑️ Dropped atomic group ({len(dropped_group_indices)} msgs) to fit context. Tokens: {dropped_tokens}",
+                        event_call=__event_call__,
+                    )
+
+            # Re-assemble
+            candidate_messages = (
+                head_messages
+                + [summary_msg]
+                + preserved_system_messages
+                + tail_messages
+            )
+
+            await self._log(
+                "[Inlet] ✂️ Sent-context history reduced\n"
+                f"sent_context_tokens={total_tokens} | tail_size={len(tail_messages)}",
+                event_call=__event_call__,
+            )
+
+        final_messages = candidate_messages
+
+        # Calculate detailed token stats for logging
+        summary_content = summary_msg.get("content", "")
+        if not used_precise:
+            system_tokens = (
+                self._estimate_content_tokens(system_prompt_msg.get("content", ""))
+                if system_prompt_msg
+                else 0
+            )
+            head_tokens = self._estimate_messages_tokens(head_messages)
+            summary_tokens = self._estimate_content_tokens(summary_content)
+            preserved_system_tokens = self._estimate_messages_tokens(
+                preserved_system_messages
+            )
+            tail_tokens = self._estimate_messages_tokens(tail_messages)
+        else:
+            system_tokens = (
+                self._count_tokens(system_prompt_msg.get("content", ""))
+                if system_prompt_msg
+                else 0
+            )
+            head_tokens = self._calculate_messages_tokens(head_messages)
+            summary_tokens = self._count_tokens(summary_content)
+            preserved_system_tokens = self._calculate_messages_tokens(
+                preserved_system_messages
+            )
+            tail_tokens = self._calculate_messages_tokens(tail_messages)
+
+        system_info = (
+            f"System({system_tokens + preserved_system_tokens}t)"
+            if (system_prompt_msg or preserved_system_messages)
+            else "System(0t)"
+        )
+
+        total_section_tokens = (
+            system_tokens
+            + head_tokens
+            + summary_tokens
+            + preserved_system_tokens
+            + tail_tokens
+        )
+
+        await self._log(
+            "[Inlet] ✅ Sent context assembled\n"
+            f"sent_context_tokens={total_section_tokens} | {system_info} + Head({len(head_messages)} msg, {head_tokens}t) + Summary({summary_tokens}t) + Tail({len(tail_messages)} msg, {tail_tokens}t)",
+            log_type="success",
+            event_call=__event_call__,
+        )
+
+        # Prepare status message (Context Usage format)
+        if max_context_tokens > 0:
+            await self._emit_context_usage_status(
+                total_section_tokens, max_context_tokens, lang, __event_emitter__
+            )
+        else:
+            # For the case where max_context_tokens is 0, show summary info without threshold check
+            if self.valves.show_token_usage_status and __event_emitter__:
+                status_msg = self._get_translation(
+                    lang, "status_loaded_summary", count=compressed_count
+                )
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": status_msg,
+                            "done": True,
+                        },
+                    }
+                )
+
+
+        return final_messages, external_refs_injected_count
+
+    async def _assemble_plain_view(
+        self,
+        body: dict,
+        messages: List[Dict],
+        effective_keep_first: int,
+        lang: str,
+        system_prompt_msg: Optional[Dict[str, str]],
+        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> tuple:
+        """
+        Build the sent context for a chat without a stored summary: inject
+        external references if present, fit to the context budget, and
+        emit the status.
+
+        Returns (final_messages, external_refs_injected_count);
+        final_messages is None when there are no messages to send.
+        """
+        external_refs_injected_count = 0
+
+        external_refs = body.pop("__external_references__", None)
+
+        if external_refs and external_refs.get("content") and messages:
+            external_content = external_refs.get("content", "")
+            external_refs_injected_count = len(external_refs.get("references", []))
+            ref_msg = {
+                "role": "assistant",
+                "content": (
+                    f"<external_references>\n{external_content}\n</external_references>\n\n"
+                    + "Here are references to other conversations that may be relevant to this discussion."
+                ),
+                "metadata": {
+                    "is_summary": True,
+                    "is_external_references": True,
+                    "source": "external_references",
+                    "covered_until": effective_keep_first,
+                    "external_references": external_refs.get("references", []),
+                },
+            }
+
+            head_messages = messages[:effective_keep_first]
+            tail_messages = messages[effective_keep_first:]
+            candidate_messages = head_messages + [ref_msg] + tail_messages
+
+            if __event_call__:
+                await self._log(
+                    f"[Inlet] 📎 💉 Injected {external_refs_injected_count} external chat reference(s) as contextual block (head: {len(head_messages)}, tail: {len(tail_messages)})",
+                    event_call=__event_call__,
+                )
+        else:
+            candidate_messages = messages if messages else []
+
+        if not candidate_messages:
+                    return None, external_refs_injected_count
+
+        final_messages = candidate_messages
+
+        calc_messages = candidate_messages
+        if system_prompt_msg:
+            is_in_messages = any(
+                m.get("role") == "system" for m in candidate_messages
+            )
+            if not is_in_messages:
+                calc_messages = [system_prompt_msg] + candidate_messages
+
+        # Get max context limit
+        model = self._clean_model_id(body.get("model"))
+        thresholds = self._get_model_thresholds(model) or {}
+        max_context_tokens = thresholds.get(
+            "max_context_tokens", self.valves.max_context_tokens
+        )
+
+        # --- Fast Estimation Check ---
+        # Only skip precise calculation if we are clearly below the limit
+        # max_context_tokens == 0 means "no limit", skip reduction entirely
+        total_tokens, estimated_tokens, used_precise = (
+            await self._resolve_context_tokens(calc_messages, max_context_tokens)
+        )
+        if max_context_tokens <= 0:
+            await self._log(
+                f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
+                event_call=__event_call__,
+            )
+        elif not used_precise:
+            await self._log(
+                f"[Inlet] 🔎 Fast limit check (Est): {total_tokens}t / {max_context_tokens}t",
+                event_call=__event_call__,
+            )
+
+        if total_tokens > max_context_tokens and max_context_tokens > 0:
+            await self._log(
+                f"[Inlet] ⚠️ Original messages ({total_tokens} Tokens) exceed limit ({max_context_tokens}). Reducing history...",
+                log_type="warning",
+                event_call=__event_call__,
+            )
+
+            # Use atomic grouping to preserve tool-calling integrity
+            trimmable = candidate_messages[effective_keep_first:]
+            atomic_groups = self._get_atomic_groups(trimmable)
+
+            # To follow policy "system messages never lost", we maintain a list of
+            # system messages that were part of dropped groups.
+            dropped_but_preserved_systems = []
+
+            # Absolute protections when dropping groups:
+            # 1. External references (often large and specialized)
+            # 2. System messages (instructions)
+            while total_tokens > max_context_tokens and len(atomic_groups) > 1:
+                dropped_group_indices = atomic_groups.pop(0)
+                dropped_tokens = self._drop_oldest_atomic_group(
+                    trimmable,
+                    dropped_group_indices,
+                    used_precise,
+                    preserve_protected=True,
+                    preserved_systems=dropped_but_preserved_systems,
+                )
+                total_tokens -= dropped_tokens
+
+            # Re-assemble: [Head] + [Preserved Systems from Dropped Groups] + [Remaining Trimmable/Tail]
+            candidate_messages = (
+                candidate_messages[:effective_keep_first]
+                + dropped_but_preserved_systems
+                + trimmable
+            )
+
+            await self._log(
+                f"[Inlet] ✂️ Messages reduced (atomic). New total: {total_tokens} Tokens",
+                event_call=__event_call__,
+            )
+
+        # Send status notification (Context Usage format)
+        await self._emit_context_usage_status(
+            total_tokens, max_context_tokens, lang, __event_emitter__
+        )
+
+        return final_messages, external_refs_injected_count
+
+    async def inlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: dict = None,
+        __request__: Request = None,
+        __model__: dict = None,
+        __event_emitter__: Callable[[Any], Awaitable[None]] = None,
+        __event_call__: Callable[[Any], Awaitable[None]] = None,
+    ) -> dict:
+        """
+        Executed before sending to the LLM.
+        Compression Strategy: Only responsible for injecting existing summaries, no Token calculation.
+        """
+
+        if self._should_skip_compression(body):
+            if self.valves.debug_mode:
+                logger.info(
+                    "[Inlet] Skipping compression: copilot_sdk detected in base model"
+                )
+            return body
+
+        messages = body.get("messages", [])
+        user_ctx = await self._get_user_context(__user__, __event_call__)
+        lang = user_ctx["user_language"]
+
+        normalized_tool_call_count = self._normalize_native_tool_call_ids(messages)
+        if (
+            normalized_tool_call_count > 0
+            and self.valves.show_debug_log
+            and __event_call__
+        ):
+            await self._log(
+                f"[Inlet] 🪪 Normalized {normalized_tool_call_count} overlong tool call ID(s).",
+                event_call=__event_call__,
+            )
+
+        # --- Native Tool Output Trimming (Opt-in, only for native function calling) ---
+        function_calling_mode = self._get_function_calling_mode(body)
+        is_native_func_calling = function_calling_mode == "native"
+
+        if self.valves.show_debug_log and __event_call__:
+            trimming_state = (
+                "enabled" if self.valves.enable_tool_output_trimming else "disabled"
+            )
+            await self._log(
+                "[Inlet] ✂️ Tool trimming check: "
+                f"state={trimming_state}, function_calling={function_calling_mode or 'unset'}, "
+                f"message_count={len(messages)}",
+                event_call=__event_call__,
+            )
+
+        if self.valves.enable_tool_output_trimming and is_native_func_calling:
+            trimmed_count = self._trim_native_tool_outputs(messages, lang)
+            if self.valves.show_debug_log and __event_call__:
+                await self._log(
+                    f"[Inlet] ✂️ Tool trimming: {trimmed_count} tool output(s) trimmed.",
+                    event_call=__event_call__,
+                )
+        elif self.valves.show_debug_log and __event_call__:
+            skip_reason = (
+                "tool trimming disabled"
+                if not self.valves.enable_tool_output_trimming
+                else f"function_calling={function_calling_mode or 'unset'}"
+            )
+            await self._log(
+                f"[Inlet] ✂️ Tool trimming skipped: {skip_reason}.",
+                event_call=__event_call__,
+            )
+
+        chat_ctx = self._get_chat_context(body, __metadata__)
+        chat_id = chat_ctx["chat_id"]
+
+        body = await self._handle_external_chat_references(
+            body,
+            user_data=__user__,
+            __event_call__=__event_call__,
+            __request__=__request__,
+        )
+        messages = body.get("messages", [])
+
+        # Extract system prompt for accurate token calculation (DB -> messages fallback)
+        system_prompt_msg = await self._extract_inlet_system_prompt(
+            body, messages, __event_call__
+        )
+
         if not chat_id:
             await self._log(
                 "[Inlet] ❌ Missing chat_id in metadata, skipping compression",
@@ -361,337 +750,36 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         # Calculate effective_keep_first to ensure all system messages are protected
         effective_keep_first = self._get_effective_keep_first(messages)
 
-        final_messages = []
-        external_refs_injected_count = 0
-
         if summary_record:
-            # Summary exists, build view: [Head] + [Summary Message] + [Tail]
-            # Tail is all messages after the last compression point
-            compressed_count = summary_record.compressed_message_count
-
-            # Ensure compressed_count is reasonable
-            if compressed_count > len(messages):
-                compressed_count = max(0, len(messages) - self.valves.keep_last)
-
-            # 1. Head messages (Keep First)
-            head_messages = []
-            if effective_keep_first > 0:
-                head_messages = messages[:effective_keep_first]
-
-            # 2. Tail messages (Tail) - All messages starting from the last compression point.
-            # Align legacy/raw progress to an atomic boundary so old summary rows do not
-            # reintroduce orphaned tool messages into the retained tail.
-            raw_start_index = max(compressed_count, effective_keep_first)
-            start_index = self._align_tail_start_to_atomic_boundary(
-                messages, raw_start_index, effective_keep_first
+            # Summary exists: build [Head] + [Summary Message] + [Tail]
+            final_messages, external_refs_injected_count = (
+                await self._assemble_summary_view(
+                    body,
+                    messages,
+                    summary_record,
+                    lang,
+                    effective_keep_first,
+                    system_prompt_msg,
+                    __event_call__,
+                    __event_emitter__,
+                )
             )
-
-            # --- Extract Preserved System Messages from the Gap ---
-            # Any system message in the gap (messages[effective_keep_first:start_index])
-            # must be preserved according to policy.
-            gap_messages = messages[effective_keep_first:start_index]
-            preserved_system_messages = [
-                msg
-                for msg in gap_messages
-                if isinstance(msg, dict) and msg.get("role") == "system"
-            ]
-
-            # 3. Summary message (Inserted as Assistant message)
-            external_refs = body.pop("__external_references__", None)
-            summary_msg = self._build_summary_message(
-                summary_record.summary,
-                lang,
-                start_index,
-            )
-
-            if external_refs:
-                external_content = external_refs.get("content", "")
-                if external_content:
-                    external_refs_injected_count = len(
-                        external_refs.get("references", [])
-                    )
-                    summary_msg["content"] = (
-                        f"<external_references>\n{external_content}\n</external_references>\n\n"
-                        + summary_msg["content"]
-                    )
-                    summary_msg["metadata"]["external_references"] = external_refs.get(
-                        "references", []
-                    )
-
-            tail_messages = messages[start_index:]
-
-            # --- Preflight Check & Budgeting (Simplified) ---
-
-            # Assemble candidate messages (for output)
-            candidate_messages = (
-                head_messages
-                + [summary_msg]
-                + preserved_system_messages
-                + tail_messages
-            )
-
-            # Prepare messages for token calculation (include system prompt if missing)
-            calc_messages = candidate_messages
-            if system_prompt_msg:
-                # Check if system prompt is already in head_messages
-                is_in_head = any(m.get("role") == "system" for m in head_messages)
-                if not is_in_head:
-                    calc_messages = [system_prompt_msg] + candidate_messages
-
-            # Get max context limit
-            model = self._clean_model_id(body.get("model"))
-            thresholds = self._get_model_thresholds(model)
-            max_context_tokens = thresholds.get(
-                "max_context_tokens", self.valves.max_context_tokens
-            )
-
-            # --- Fast Estimation Check ---
-            # Since this is a hard limit check, only skip precise calculation if we are far below it (margin of 15%)
-            # max_context_tokens == 0 means "no limit", skip reduction entirely
-            total_tokens, estimated_tokens, used_precise = (
-                await self._resolve_context_tokens(calc_messages, max_context_tokens)
-            )
-            if max_context_tokens <= 0:
-                await self._log(
-                    f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
-                    event_call=__event_call__,
-                )
-            elif not used_precise:
-                await self._log(
-                    "[Inlet] 🔎 Sent-context preflight (estimated)\n"
-                    f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | status=well_within_limit",
-                    event_call=__event_call__,
-                )
-            else:
-                # Preflight Check Log
-                await self._log(
-                    "[Inlet] 🔎 Sent-context preflight (precise)\n"
-                    f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | usage={(total_tokens/max_context_tokens*100):.1f}%",
-                    event_call=__event_call__,
-                )
-
-                # Identify atomic groups to avoid breaking tool-calling context
-                atomic_groups = self._get_atomic_groups(tail_messages)
-
-                while total_tokens > max_context_tokens and len(atomic_groups) > 1:
-                    # Drop the oldest atomic group entirely (never cut through a
-                    # tool-calling block).
-                    dropped_group_indices = atomic_groups.pop(0)
-                    dropped_tokens = self._drop_oldest_atomic_group(
-                        tail_messages,
-                        dropped_group_indices,
-                        used_precise,
-                        preserve_protected=False,
-                        preserved_systems=None,
-                    )
-                    total_tokens -= dropped_tokens
-
-                    if self.valves.show_debug_log and __event_call__:
-                        await self._log(
-                            f"[Inlet] 🗑️ Dropped atomic group ({len(dropped_group_indices)} msgs) to fit context. Tokens: {dropped_tokens}",
-                            event_call=__event_call__,
-                        )
-
-                # Re-assemble
-                candidate_messages = (
-                    head_messages
-                    + [summary_msg]
-                    + preserved_system_messages
-                    + tail_messages
-                )
-
-                await self._log(
-                    "[Inlet] ✂️ Sent-context history reduced\n"
-                    f"sent_context_tokens={total_tokens} | tail_size={len(tail_messages)}",
-                    event_call=__event_call__,
-                )
-
-            final_messages = candidate_messages
-
-            # Calculate detailed token stats for logging
-            summary_content = summary_msg.get("content", "")
-            if not used_precise:
-                system_tokens = (
-                    self._estimate_content_tokens(system_prompt_msg.get("content", ""))
-                    if system_prompt_msg
-                    else 0
-                )
-                head_tokens = self._estimate_messages_tokens(head_messages)
-                summary_tokens = self._estimate_content_tokens(summary_content)
-                preserved_system_tokens = self._estimate_messages_tokens(
-                    preserved_system_messages
-                )
-                tail_tokens = self._estimate_messages_tokens(tail_messages)
-            else:
-                system_tokens = (
-                    self._count_tokens(system_prompt_msg.get("content", ""))
-                    if system_prompt_msg
-                    else 0
-                )
-                head_tokens = self._calculate_messages_tokens(head_messages)
-                summary_tokens = self._count_tokens(summary_content)
-                preserved_system_tokens = self._calculate_messages_tokens(
-                    preserved_system_messages
-                )
-                tail_tokens = self._calculate_messages_tokens(tail_messages)
-
-            system_info = (
-                f"System({system_tokens + preserved_system_tokens}t)"
-                if (system_prompt_msg or preserved_system_messages)
-                else "System(0t)"
-            )
-
-            total_section_tokens = (
-                system_tokens
-                + head_tokens
-                + summary_tokens
-                + preserved_system_tokens
-                + tail_tokens
-            )
-
-            await self._log(
-                "[Inlet] ✅ Sent context assembled\n"
-                f"sent_context_tokens={total_section_tokens} | {system_info} + Head({len(head_messages)} msg, {head_tokens}t) + Summary({summary_tokens}t) + Tail({len(tail_messages)} msg, {tail_tokens}t)",
-                log_type="success",
-                event_call=__event_call__,
-            )
-
-            # Prepare status message (Context Usage format)
-            if max_context_tokens > 0:
-                await self._emit_context_usage_status(
-                    total_section_tokens, max_context_tokens, lang, __event_emitter__
-                )
-            else:
-                # For the case where max_context_tokens is 0, show summary info without threshold check
-                if self.valves.show_token_usage_status and __event_emitter__:
-                    status_msg = self._get_translation(
-                        lang, "status_loaded_summary", count=compressed_count
-                    )
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": status_msg,
-                                "done": True,
-                            },
-                        }
-                    )
-
         else:
-            external_refs = body.pop("__external_references__", None)
-
-            if external_refs and external_refs.get("content") and messages:
-                external_content = external_refs.get("content", "")
-                external_refs_injected_count = len(external_refs.get("references", []))
-                ref_msg = {
-                    "role": "assistant",
-                    "content": (
-                        f"<external_references>\n{external_content}\n</external_references>\n\n"
-                        + "Here are references to other conversations that may be relevant to this discussion."
-                    ),
-                    "metadata": {
-                        "is_summary": True,
-                        "is_external_references": True,
-                        "source": "external_references",
-                        "covered_until": effective_keep_first,
-                        "external_references": external_refs.get("references", []),
-                    },
-                }
-
-                head_messages = messages[:effective_keep_first]
-                tail_messages = messages[effective_keep_first:]
-                candidate_messages = head_messages + [ref_msg] + tail_messages
-
-                if __event_call__:
-                    await self._log(
-                        f"[Inlet] 📎 💉 Injected {external_refs_injected_count} external chat reference(s) as contextual block (head: {len(head_messages)}, tail: {len(tail_messages)})",
-                        event_call=__event_call__,
-                    )
-            else:
-                candidate_messages = messages if messages else []
-
-            if not candidate_messages:
+            # No stored summary: send raw history (with external refs if any)
+            final_messages, external_refs_injected_count = (
+                await self._assemble_plain_view(
+                    body,
+                    messages,
+                    effective_keep_first,
+                    lang,
+                    system_prompt_msg,
+                    __event_call__,
+                    __event_emitter__,
+                )
+            )
+            if final_messages is None:
+                # No messages to send — nothing to compress
                 return body
-
-            final_messages = candidate_messages
-
-            calc_messages = candidate_messages
-            if system_prompt_msg:
-                is_in_messages = any(
-                    m.get("role") == "system" for m in candidate_messages
-                )
-                if not is_in_messages:
-                    calc_messages = [system_prompt_msg] + candidate_messages
-
-            # Get max context limit
-            model = self._clean_model_id(body.get("model"))
-            thresholds = self._get_model_thresholds(model) or {}
-            max_context_tokens = thresholds.get(
-                "max_context_tokens", self.valves.max_context_tokens
-            )
-
-            # --- Fast Estimation Check ---
-            # Only skip precise calculation if we are clearly below the limit
-            # max_context_tokens == 0 means "no limit", skip reduction entirely
-            total_tokens, estimated_tokens, used_precise = (
-                await self._resolve_context_tokens(calc_messages, max_context_tokens)
-            )
-            if max_context_tokens <= 0:
-                await self._log(
-                    f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
-                    event_call=__event_call__,
-                )
-            elif not used_precise:
-                await self._log(
-                    f"[Inlet] 🔎 Fast limit check (Est): {total_tokens}t / {max_context_tokens}t",
-                    event_call=__event_call__,
-                )
-
-            if total_tokens > max_context_tokens and max_context_tokens > 0:
-                await self._log(
-                    f"[Inlet] ⚠️ Original messages ({total_tokens} Tokens) exceed limit ({max_context_tokens}). Reducing history...",
-                    log_type="warning",
-                    event_call=__event_call__,
-                )
-
-                # Use atomic grouping to preserve tool-calling integrity
-                trimmable = candidate_messages[effective_keep_first:]
-                atomic_groups = self._get_atomic_groups(trimmable)
-
-                # To follow policy "system messages never lost", we maintain a list of
-                # system messages that were part of dropped groups.
-                dropped_but_preserved_systems = []
-
-                # Absolute protections when dropping groups:
-                # 1. External references (often large and specialized)
-                # 2. System messages (instructions)
-                while total_tokens > max_context_tokens and len(atomic_groups) > 1:
-                    dropped_group_indices = atomic_groups.pop(0)
-                    dropped_tokens = self._drop_oldest_atomic_group(
-                        trimmable,
-                        dropped_group_indices,
-                        used_precise,
-                        preserve_protected=True,
-                        preserved_systems=dropped_but_preserved_systems,
-                    )
-                    total_tokens -= dropped_tokens
-
-                # Re-assemble: [Head] + [Preserved Systems from Dropped Groups] + [Remaining Trimmable/Tail]
-                candidate_messages = (
-                    candidate_messages[:effective_keep_first]
-                    + dropped_but_preserved_systems
-                    + trimmable
-                )
-
-                await self._log(
-                    f"[Inlet] ✂️ Messages reduced (atomic). New total: {total_tokens} Tokens",
-                    event_call=__event_call__,
-                )
-
-            # Send status notification (Context Usage format)
-            await self._emit_context_usage_status(
-                total_tokens, max_context_tokens, lang, __event_emitter__
-            )
 
         body["messages"] = final_messages
         self._capture_pending_inlet_messages(chat_id, final_messages)

@@ -696,7 +696,7 @@ class DBMixin:
             logger.error(f"[Load] ❌ Database read failed: {str(e)}")
         return None
 
-    async def _load_summary(self, chat_id: str, body: dict) -> Optional[str]:
+    async def _load_summary(self, chat_id: str) -> Optional[str]:
         """Loads the summary text from the database (async, compatible with 0.9.0)."""
         record = await self._load_summary_record(chat_id)
         if record:
@@ -770,31 +770,12 @@ class ToolCallMixin:
 
         return sum(1 for old_id, new_id in rewritten_ids.items() if old_id != new_id)
 
-    def _trim_native_tool_outputs(
-        self, messages: List[Dict], lang: str, collect_debug: bool = False
-    ) -> tuple[int, Optional[Dict[str, Any]]]:
+    def _trim_native_tool_outputs(self, messages: List[Dict], lang: str) -> int:
         """Collapse verbose native tool outputs while preserving tool-call structure."""
         trimmed_count = 0
         tool_trim_threshold_chars = self.valves.tool_trim_threshold_chars
         collapsed_text = self._get_translation(lang, "content_collapsed").strip()
         atomic_groups = self._get_atomic_groups(messages)
-        debug_stats = (
-            {
-                "threshold_chars": tool_trim_threshold_chars,
-                "atomic_groups": len(atomic_groups),
-                "native_groups_checked": 0,
-                "native_groups_over_threshold": 0,
-                "largest_native_group_chars": 0,
-                "native_group_samples": [],
-                "detail_messages_checked": 0,
-                "detail_blocks_found": 0,
-                "detail_blocks_over_threshold": 0,
-                "largest_detail_result_chars": 0,
-                "detail_block_samples": [],
-            }
-            if collect_debug
-            else None
-        )
 
         for group in atomic_groups:
             if len(group) < 2:
@@ -826,25 +807,8 @@ class ToolCallMixin:
                 continue
 
             tool_chars = sum(len(str(msg.get("content", ""))) for msg in tool_messages)
-            if debug_stats is not None:
-                debug_stats["native_groups_checked"] += 1
-                debug_stats["largest_native_group_chars"] = max(
-                    debug_stats["largest_native_group_chars"], tool_chars
-                )
-                if len(debug_stats["native_group_samples"]) < 5:
-                    debug_stats["native_group_samples"].append(
-                        {
-                            "group_size": len(grouped_messages),
-                            "tool_count": len(tool_messages),
-                            "tool_chars": tool_chars,
-                            "trimmed": tool_chars >= tool_trim_threshold_chars,
-                        }
-                    )
-
             if tool_chars < tool_trim_threshold_chars:
                 continue
-            if debug_stats is not None:
-                debug_stats["native_groups_over_threshold"] += 1
 
             for tool_message in tool_messages:
                 metadata = tool_message.get("metadata", {})
@@ -879,8 +843,6 @@ class ToolCallMixin:
                 continue
 
             trimmed_blocks = 0
-            if debug_stats is not None:
-                debug_stats["detail_messages_checked"] += 1
 
             def _replace_tool_block(match: re.Match) -> str:
                 nonlocal trimmed_blocks
@@ -891,19 +853,9 @@ class ToolCallMixin:
                     return block
 
                 result_chars = len(result_match.group(1))
-                if debug_stats is not None:
-                    debug_stats["detail_blocks_found"] += 1
-                    debug_stats["largest_detail_result_chars"] = max(
-                        debug_stats["largest_detail_result_chars"], result_chars
-                    )
-                    if len(debug_stats["detail_block_samples"]) < 5:
-                        debug_stats["detail_block_samples"].append(result_chars)
-
                 if result_chars < tool_trim_threshold_chars:
                     return block
 
-                if debug_stats is not None:
-                    debug_stats["detail_blocks_over_threshold"] += 1
                 trimmed_blocks += 1
                 return re.sub(
                     r'result="([^"]*)"',
@@ -930,7 +882,7 @@ class ToolCallMixin:
             message["content"] = new_content
             trimmed_count += trimmed_blocks
 
-        return trimmed_count, debug_stats
+        return trimmed_count
 
     def _get_atomic_groups(self, messages: List[Dict]) -> List[List[int]]:
         """
@@ -1395,8 +1347,6 @@ class CompressionMixin:
         else:
             user_data = {}
 
-        user_id = user_data.get("id", "unknown_user")
-        user_name = user_data.get("name", "User")
         user_language = user_data.get("language", "en-US")
 
         if __event_call__:
@@ -1430,8 +1380,6 @@ class CompressionMixin:
                 )
 
         return {
-            "user_id": user_id,
-            "user_name": user_name,
             "user_language": user_language,
         }
 
@@ -1545,41 +1493,31 @@ class CompressionMixin:
         self, body: dict, __metadata__: Optional[dict] = None
     ) -> Dict[str, str]:
         """
-        Unified extraction of chat context information (chat_id, message_id).
+        Unified extraction of chat context information (chat_id).
         Prioritizes extraction from body, then metadata.
         """
         chat_id = ""
-        message_id = ""
 
         # 1. Try to get from body
         if isinstance(body, dict):
             chat_id = body.get("chat_id", "")
-            message_id = body.get("id", "")  # message_id is usually 'id' in body
 
             # Check body.metadata as fallback
-            if not chat_id or not message_id:
+            if not chat_id:
                 body_metadata = body.get("metadata", {})
                 if isinstance(body_metadata, dict):
-                    if not chat_id:
-                        chat_id = body_metadata.get("chat_id", "")
-                    if not message_id:
-                        message_id = body_metadata.get("message_id", "")
+                    chat_id = body_metadata.get("chat_id", "")
 
         # 2. Try to get from __metadata__ (as supplement)
         if __metadata__ and isinstance(__metadata__, dict):
             if not chat_id:
                 chat_id = __metadata__.get("chat_id", "")
-            if not message_id:
-                message_id = __metadata__.get("message_id", "")
 
         return {
             "chat_id": str(chat_id).strip(),
-            "message_id": str(message_id).strip(),
         }
 
-    def _should_skip_compression(
-        self, body: dict, __model__: Optional[dict] = None
-    ) -> bool:
+    def _should_skip_compression(self, body: dict) -> bool:
         """
         Check if compression should be skipped.
         Returns True if:
@@ -1921,7 +1859,7 @@ class SummarizeMixin:
             # When summary_index is None the outlet messages come from raw DB history that
             # has never had the summary injected, so we must load it from DB explicitly.
             if summary_index is None:
-                previous_summary = await self._load_summary(chat_id, body)
+                previous_summary = await self._load_summary(chat_id)
                 if previous_summary:
                     await self._log(
                         "[🤖 Async Summary Task] Loaded previous summary from DB to pass as context (summary not in messages)",
@@ -2228,8 +2166,6 @@ class SummarizeMixin:
                     }
                 )
 
-            import traceback
-
             logger.exception("[🤖 Async Summary Task] Unhandled exception")
 
     def _truncate_messages_for_summary(self, messages: list, max_tokens: int) -> str:
@@ -2240,10 +2176,7 @@ class SummarizeMixin:
             role = msg.get("role", "unknown")
             content = self._extract_text_content(msg.get("content", ""))
             msg_id = msg.get("id", "N/A")
-            msg_name = msg.get("name", "")
-
-            name_part = f" [ID: {msg_id}]" if msg_name else f" [ID: {msg_id}]"
-            formatted_msg = f"#### {role.capitalize()}{name_part}\n{content}\n"
+            formatted_msg = f"#### {role.capitalize()} [ID: {msg_id}]\n{content}\n"
             formatted_msg_tokens = _estimate_text_tokens(formatted_msg)
 
             if total_tokens + formatted_msg_tokens > max_tokens:
@@ -2543,10 +2476,8 @@ Return only the XML working memory:
             # Handle JSONResponse (some backends return JSONResponse instead of dict)
             if hasattr(response, "body"):
                 # It's a Response object, extract the body
-                import json as json_module
-
                 try:
-                    response = json_module.loads(response.body.decode("utf-8"))
+                    response = json.loads(response.body.decode("utf-8"))
                 except Exception:
                     raise ValueError(f"Failed to parse JSONResponse body: {response}")
 
@@ -2874,94 +2805,6 @@ class ExternalRefsMixin:
 
         return body
 
-    async def _generate_referenced_summaries_background(
-        self,
-        referenced_chats: List[Dict[str, Any]],
-        user_data: Optional[dict] = None,
-        __request__: Request = None,
-        __event_call__: Callable = None,
-    ) -> List[Dict[str, Any]]:
-        """Generate cacheable summaries for referenced chats when enough context is available."""
-        if not referenced_chats:
-            return []
-
-        generated_summaries = []
-        summary_model = self._clean_model_id(self.valves.summary_model) or "gpt-4o-mini"
-        summary_model_max_context = self._get_summary_model_context_limit(summary_model)
-
-        for referenced_chat in referenced_chats:
-            if not isinstance(referenced_chat, dict):
-                continue
-
-            ref_chat_id = referenced_chat.get("chat_id")
-            ref_chat_title = referenced_chat.get("title", "Unknown Chat")
-            if not ref_chat_id:
-                continue
-
-            summary_input_text = referenced_chat.get("conversation_text", "")
-            covers_full_history = bool(referenced_chat.get("covers_full_history", True))
-            covered_message_count = int(
-                referenced_chat.get("covered_message_count", 0) or 0
-            )
-
-            if (
-                not isinstance(summary_input_text, str)
-                or not summary_input_text.strip()
-            ):
-                chat_messages = await self._load_full_chat_messages(ref_chat_id)
-                if not chat_messages:
-                    continue
-                summary_input_text = self._format_messages_for_summary(chat_messages)
-                covers_full_history = True
-                covered_message_count = len(chat_messages)
-
-            estimated_tokens = _estimate_text_tokens(summary_input_text)
-            if (
-                summary_model_max_context > 0
-                and estimated_tokens > summary_model_max_context
-            ):
-                chat_messages = await self._load_full_chat_messages(ref_chat_id)
-                if chat_messages:
-                    summary_input_text = self._truncate_messages_for_summary(
-                        chat_messages, summary_model_max_context
-                    )
-                    covers_full_history = False
-                    covered_message_count = 0
-
-            if not isinstance(user_data, dict) or not user_data.get("id"):
-                continue
-
-            summary = await self._call_summary_llm(
-                summary_input_text,
-                {"model": summary_model},
-                user_data,
-                __event_call__,
-                __request__,
-                previous_summary=None,
-            )
-
-            if not summary:
-                continue
-
-            generated_summaries.append(
-                {
-                    "chat_id": ref_chat_id,
-                    "title": ref_chat_title,
-                    "summary": summary,
-                    "covers_full_history": covers_full_history,
-                    "covered_message_count": covered_message_count,
-                }
-            )
-
-            if covers_full_history and covered_message_count > 0:
-                await self._save_summary(
-                    ref_chat_id,
-                    summary,
-                    covered_message_count,
-                )
-
-        return generated_summaries
-
 # ── console.py · Frontend console logging + status ────────────────────
 # Fragment: relies on shared imports/constants from _header.py.
 # Not importable standalone — assembled into v1.6.1.py by build.py.
@@ -3206,7 +3049,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         Compression Strategy: Only responsible for injecting existing summaries, no Token calculation.
         """
 
-        if self._should_skip_compression(body, __model__):
+        if self._should_skip_compression(body):
             if self.valves.debug_mode:
                 logger.info(
                     "[Inlet] Skipping compression: copilot_sdk detected in base model"
@@ -3244,11 +3087,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             )
 
         if self.valves.enable_tool_output_trimming and is_native_func_calling:
-            trimmed_count, trim_debug = self._trim_native_tool_outputs(
-                messages,
-                lang,
-                collect_debug=bool(self.valves.show_debug_log and __event_call__),
-            )
+            trimmed_count = self._trim_native_tool_outputs(messages, lang)
+            if self.valves.show_debug_log and __event_call__:
+                await self._log(
+                    f"[Inlet] ✂️ Tool trimming: {trimmed_count} tool output(s) trimmed.",
+                    event_call=__event_call__,
+                )
         elif self.valves.show_debug_log and __event_call__:
             skip_reason = (
                 "tool trimming disabled"
@@ -3931,7 +3775,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         Calculates Token count in the background and triggers summary generation (does not block current response, does not affect content output).
         """
         # Check if compression should be skipped (e.g., for copilot_sdk)
-        if self._should_skip_compression(body, __model__):
+        if self._should_skip_compression(body):
             if self.valves.debug_mode:
                 logger.info(
                     "[Outlet] Skipping compression: copilot_sdk detected in base model"
@@ -3971,32 +3815,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 else messages
             )
             summary_messages = self._unfold_messages(messages_to_unfold)
-            if messages_to_unfold is db_messages:
-                message_source = (
-                    "outlet-db-unfolded"
-                    if len(summary_messages) != len(db_messages)
-                    else "outlet-db"
-                )
-            else:
-                message_source = (
-                    "outlet-body-unfolded"
-                    if len(summary_messages) != len(messages)
-                    else "outlet-body"
-                )
         else:
             summary_messages = self._unfold_messages(messages)
-            message_source = (
-                "outlet-body-unfolded"
-                if len(summary_messages) != len(messages)
-                else "outlet-body"
-            )
 
-        restored_count_before = len(summary_messages)
         summary_messages = self._restore_pending_inlet_messages(
             chat_id, summary_messages
         )
-        if len(summary_messages) != restored_count_before:
-            message_source = f"{message_source}+pending"
 
         # Calculate target compression progress directly, then align it to an atomic
         # boundary so the saved summary never cuts through a tool-calling block.

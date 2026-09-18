@@ -60,31 +60,12 @@ class ToolCallMixin:
 
         return sum(1 for old_id, new_id in rewritten_ids.items() if old_id != new_id)
 
-    def _trim_native_tool_outputs(
-        self, messages: List[Dict], lang: str, collect_debug: bool = False
-    ) -> tuple[int, Optional[Dict[str, Any]]]:
+    def _trim_native_tool_outputs(self, messages: List[Dict], lang: str) -> int:
         """Collapse verbose native tool outputs while preserving tool-call structure."""
         trimmed_count = 0
         tool_trim_threshold_chars = self.valves.tool_trim_threshold_chars
         collapsed_text = self._get_translation(lang, "content_collapsed").strip()
         atomic_groups = self._get_atomic_groups(messages)
-        debug_stats = (
-            {
-                "threshold_chars": tool_trim_threshold_chars,
-                "atomic_groups": len(atomic_groups),
-                "native_groups_checked": 0,
-                "native_groups_over_threshold": 0,
-                "largest_native_group_chars": 0,
-                "native_group_samples": [],
-                "detail_messages_checked": 0,
-                "detail_blocks_found": 0,
-                "detail_blocks_over_threshold": 0,
-                "largest_detail_result_chars": 0,
-                "detail_block_samples": [],
-            }
-            if collect_debug
-            else None
-        )
 
         for group in atomic_groups:
             if len(group) < 2:
@@ -116,25 +97,8 @@ class ToolCallMixin:
                 continue
 
             tool_chars = sum(len(str(msg.get("content", ""))) for msg in tool_messages)
-            if debug_stats is not None:
-                debug_stats["native_groups_checked"] += 1
-                debug_stats["largest_native_group_chars"] = max(
-                    debug_stats["largest_native_group_chars"], tool_chars
-                )
-                if len(debug_stats["native_group_samples"]) < 5:
-                    debug_stats["native_group_samples"].append(
-                        {
-                            "group_size": len(grouped_messages),
-                            "tool_count": len(tool_messages),
-                            "tool_chars": tool_chars,
-                            "trimmed": tool_chars >= tool_trim_threshold_chars,
-                        }
-                    )
-
             if tool_chars < tool_trim_threshold_chars:
                 continue
-            if debug_stats is not None:
-                debug_stats["native_groups_over_threshold"] += 1
 
             for tool_message in tool_messages:
                 metadata = tool_message.get("metadata", {})
@@ -169,8 +133,6 @@ class ToolCallMixin:
                 continue
 
             trimmed_blocks = 0
-            if debug_stats is not None:
-                debug_stats["detail_messages_checked"] += 1
 
             def _replace_tool_block(match: re.Match) -> str:
                 nonlocal trimmed_blocks
@@ -181,19 +143,9 @@ class ToolCallMixin:
                     return block
 
                 result_chars = len(result_match.group(1))
-                if debug_stats is not None:
-                    debug_stats["detail_blocks_found"] += 1
-                    debug_stats["largest_detail_result_chars"] = max(
-                        debug_stats["largest_detail_result_chars"], result_chars
-                    )
-                    if len(debug_stats["detail_block_samples"]) < 5:
-                        debug_stats["detail_block_samples"].append(result_chars)
-
                 if result_chars < tool_trim_threshold_chars:
                     return block
 
-                if debug_stats is not None:
-                    debug_stats["detail_blocks_over_threshold"] += 1
                 trimmed_blocks += 1
                 return re.sub(
                     r'result="([^"]*)"',
@@ -220,7 +172,7 @@ class ToolCallMixin:
             message["content"] = new_content
             trimmed_count += trimmed_blocks
 
-        return trimmed_count, debug_stats
+        return trimmed_count
 
     def _get_atomic_groups(self, messages: List[Dict]) -> List[List[int]]:
         """

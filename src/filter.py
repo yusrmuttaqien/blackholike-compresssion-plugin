@@ -116,7 +116,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         Compression Strategy: Only responsible for injecting existing summaries, no Token calculation.
         """
 
-        if self._should_skip_compression(body, __model__):
+        if self._should_skip_compression(body):
             if self.valves.debug_mode:
                 logger.info(
                     "[Inlet] Skipping compression: copilot_sdk detected in base model"
@@ -154,11 +154,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             )
 
         if self.valves.enable_tool_output_trimming and is_native_func_calling:
-            trimmed_count, trim_debug = self._trim_native_tool_outputs(
-                messages,
-                lang,
-                collect_debug=bool(self.valves.show_debug_log and __event_call__),
-            )
+            trimmed_count = self._trim_native_tool_outputs(messages, lang)
+            if self.valves.show_debug_log and __event_call__:
+                await self._log(
+                    f"[Inlet] ✂️ Tool trimming: {trimmed_count} tool output(s) trimmed.",
+                    event_call=__event_call__,
+                )
         elif self.valves.show_debug_log and __event_call__:
             skip_reason = (
                 "tool trimming disabled"
@@ -841,7 +842,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         Calculates Token count in the background and triggers summary generation (does not block current response, does not affect content output).
         """
         # Check if compression should be skipped (e.g., for copilot_sdk)
-        if self._should_skip_compression(body, __model__):
+        if self._should_skip_compression(body):
             if self.valves.debug_mode:
                 logger.info(
                     "[Outlet] Skipping compression: copilot_sdk detected in base model"
@@ -881,32 +882,12 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 else messages
             )
             summary_messages = self._unfold_messages(messages_to_unfold)
-            if messages_to_unfold is db_messages:
-                message_source = (
-                    "outlet-db-unfolded"
-                    if len(summary_messages) != len(db_messages)
-                    else "outlet-db"
-                )
-            else:
-                message_source = (
-                    "outlet-body-unfolded"
-                    if len(summary_messages) != len(messages)
-                    else "outlet-body"
-                )
         else:
             summary_messages = self._unfold_messages(messages)
-            message_source = (
-                "outlet-body-unfolded"
-                if len(summary_messages) != len(messages)
-                else "outlet-body"
-            )
 
-        restored_count_before = len(summary_messages)
         summary_messages = self._restore_pending_inlet_messages(
             chat_id, summary_messages
         )
-        if len(summary_messages) != restored_count_before:
-            message_source = f"{message_source}+pending"
 
         # Calculate target compression progress directly, then align it to an atomic
         # boundary so the saved summary never cuts through a tool-calling block.

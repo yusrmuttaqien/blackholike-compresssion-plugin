@@ -275,8 +275,6 @@ class CompressionMixin:
         else:
             user_data = {}
 
-        user_id = user_data.get("id", "unknown_user")
-        user_name = user_data.get("name", "User")
         user_language = user_data.get("language", "en-US")
 
         if __event_call__:
@@ -310,8 +308,6 @@ class CompressionMixin:
                 )
 
         return {
-            "user_id": user_id,
-            "user_name": user_name,
             "user_language": user_language,
         }
 
@@ -425,41 +421,31 @@ class CompressionMixin:
         self, body: dict, __metadata__: Optional[dict] = None
     ) -> Dict[str, str]:
         """
-        Unified extraction of chat context information (chat_id, message_id).
+        Unified extraction of chat context information (chat_id).
         Prioritizes extraction from body, then metadata.
         """
         chat_id = ""
-        message_id = ""
 
         # 1. Try to get from body
         if isinstance(body, dict):
             chat_id = body.get("chat_id", "")
-            message_id = body.get("id", "")  # message_id is usually 'id' in body
 
             # Check body.metadata as fallback
-            if not chat_id or not message_id:
+            if not chat_id:
                 body_metadata = body.get("metadata", {})
                 if isinstance(body_metadata, dict):
-                    if not chat_id:
-                        chat_id = body_metadata.get("chat_id", "")
-                    if not message_id:
-                        message_id = body_metadata.get("message_id", "")
+                    chat_id = body_metadata.get("chat_id", "")
 
         # 2. Try to get from __metadata__ (as supplement)
         if __metadata__ and isinstance(__metadata__, dict):
             if not chat_id:
                 chat_id = __metadata__.get("chat_id", "")
-            if not message_id:
-                message_id = __metadata__.get("message_id", "")
 
         return {
             "chat_id": str(chat_id).strip(),
-            "message_id": str(message_id).strip(),
         }
 
-    def _should_skip_compression(
-        self, body: dict, __model__: Optional[dict] = None
-    ) -> bool:
+    def _should_skip_compression(self, body: dict) -> bool:
         """
         Check if compression should be skipped.
         Returns True if:

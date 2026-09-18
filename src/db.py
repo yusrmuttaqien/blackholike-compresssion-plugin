@@ -345,7 +345,7 @@ class DBMixin:
             logger.error(f"[Load] ❌ Database read failed: {str(e)}")
         return None
 
-    async def _load_summary(self, chat_id: str, body: dict) -> Optional[str]:
+    async def _load_summary(self, chat_id: str) -> Optional[str]:
         """Loads the summary text from the database (async, compatible with 0.9.0)."""
         record = await self._load_summary_record(chat_id)
         if record:

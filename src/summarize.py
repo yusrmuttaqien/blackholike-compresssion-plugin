@@ -137,7 +137,7 @@ class SummarizeMixin:
             # When summary_index is None the outlet messages come from raw DB history that
             # has never had the summary injected, so we must load it from DB explicitly.
             if summary_index is None:
-                previous_summary = await self._load_summary(chat_id, body)
+                previous_summary = await self._load_summary(chat_id)
                 if previous_summary:
                     await self._log(
                         "[🤖 Async Summary Task] Loaded previous summary from DB to pass as context (summary not in messages)",
@@ -444,8 +444,6 @@ class SummarizeMixin:
                     }
                 )
 
-            import traceback
-
             logger.exception("[🤖 Async Summary Task] Unhandled exception")
 
     def _truncate_messages_for_summary(self, messages: list, max_tokens: int) -> str:
@@ -456,10 +454,7 @@ class SummarizeMixin:
             role = msg.get("role", "unknown")
             content = self._extract_text_content(msg.get("content", ""))
             msg_id = msg.get("id", "N/A")
-            msg_name = msg.get("name", "")
-
-            name_part = f" [ID: {msg_id}]" if msg_name else f" [ID: {msg_id}]"
-            formatted_msg = f"#### {role.capitalize()}{name_part}\n{content}\n"
+            formatted_msg = f"#### {role.capitalize()} [ID: {msg_id}]\n{content}\n"
             formatted_msg_tokens = _estimate_text_tokens(formatted_msg)
 
             if total_tokens + formatted_msg_tokens > max_tokens:
@@ -759,10 +754,8 @@ Return only the XML working memory:
             # Handle JSONResponse (some backends return JSONResponse instead of dict)
             if hasattr(response, "body"):
                 # It's a Response object, extract the body
-                import json as json_module
-
                 try:
-                    response = json_module.loads(response.body.decode("utf-8"))
+                    response = json.loads(response.body.decode("utf-8"))
                 except Exception:
                     raise ValueError(f"Failed to parse JSONResponse body: {response}")
 

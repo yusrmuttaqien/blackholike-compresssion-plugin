@@ -470,18 +470,30 @@ async def _call_db(method, *args, **kwargs):
         return method(*args, **kwargs)
 
 
+_db_sync_pool = None
+
+
+def _get_db_sync_pool():
+    """Shared single-worker pool for bridging async DB calls into sync contexts."""
+    global _db_sync_pool
+    if _db_sync_pool is None:
+        import concurrent.futures
+
+        _db_sync_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="owui-db"
+        )
+    return _db_sync_pool
+
+
 def _call_db_sync(method, *args, **kwargs):
     """
     Call an OpenWebUI DB model method with version-aware async handling (for sync contexts).
     - OpenWebUI <  0.9.0: DB methods are sync, call directly.
-    - OpenWebUI >= 0.9.0: DB methods are async, run in a separate thread with its own event loop.
+    - OpenWebUI >= 0.9.0: DB methods are async, run on a shared worker thread with its own event loop.
     """
     if not _owui_version_ge("0.9.0"):
         return method(*args, **kwargs)
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, method(*args, **kwargs)).result()
+    return _get_db_sync_pool().submit(asyncio.run, method(*args, **kwargs)).result()
 
 
 class ChatSummary(owui_Base):
@@ -1131,9 +1143,15 @@ class CompressionMixin:
 
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         """Get or create an asyncio lock for a specific chat ID."""
-        if chat_id not in self._chat_locks:
-            self._chat_locks[chat_id] = asyncio.Lock()
-        return self._chat_locks[chat_id]
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            # Bound growth: drop idle locks once the map gets large.
+            if len(self._chat_locks) >= 128:
+                self._chat_locks = {
+                    cid: lk for cid, lk in self._chat_locks.items() if lk.locked()
+                }
+            lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+        return lock
 
     def _capture_pending_inlet_messages(
         self, chat_id: str, messages: List[Dict[str, Any]]
@@ -1155,6 +1173,12 @@ class CompressionMixin:
 
         if pending_messages:
             self._pending_inlet_messages[chat_id] = pending_messages
+            # Bound growth: entries hold deep-copied messages; drop the oldest
+            # chat's pending messages once the map gets large.
+            if len(self._pending_inlet_messages) > 64:
+                self._pending_inlet_messages.pop(
+                    next(iter(self._pending_inlet_messages)), None
+                )
         else:
             self._pending_inlet_messages.pop(chat_id, None)
 
@@ -2128,7 +2152,9 @@ class SummarizeMixin:
                             next_context = [system_prompt_msg] + next_context
 
                     # 4. Calculate Tokens
-                    token_count = self._calculate_messages_tokens(next_context)
+                    token_count = await asyncio.to_thread(
+                        self._calculate_messages_tokens, next_context
+                    )
 
                     # 5. Get Thresholds & Calculate Ratio
                     model = self._clean_model_id(body.get("model"))
@@ -2832,7 +2858,9 @@ class ConsoleMixin:
         """Emit a browser-console log, optionally bypassing the debug-log valve."""
         if not event_call:
             return
-        if not force and not self.valves.show_debug_log:
+        if not force and (
+            not self.valves.show_debug_log or self._frontend_broadcast_broken
+        ):
             return
 
         try:
@@ -2902,7 +2930,7 @@ class ConsoleMixin:
                     "Cannot broadcast to frontend without explicit room; suppressing further frontend logs in this session."
                 )
                 if not force:
-                    self.valves.show_debug_log = False
+                    self._frontend_broadcast_broken = True
             else:
                 logger.error(f"Failed to process log to frontend: ValueError: {ve}")
         except Exception as e:
@@ -2991,6 +3019,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         # Concurrency control: Lock per chat session
         self._chat_locks = {}
         self._pending_inlet_messages: Dict[str, List[Dict[str, Any]]] = {}
+        # Set when frontend broadcasting is unavailable; stops retrying without
+        # mutating the user-configurable show_debug_log valve.
+        self._frontend_broadcast_broken = False
         self._init_database()
     class Valves(BaseModel):
         priority: int = Field(

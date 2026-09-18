@@ -17,7 +17,9 @@ class ConsoleMixin:
         """Emit a browser-console log, optionally bypassing the debug-log valve."""
         if not event_call:
             return
-        if not force and not self.valves.show_debug_log:
+        if not force and (
+            not self.valves.show_debug_log or self._frontend_broadcast_broken
+        ):
             return
 
         try:
@@ -87,7 +89,7 @@ class ConsoleMixin:
                     "Cannot broadcast to frontend without explicit room; suppressing further frontend logs in this session."
                 )
                 if not force:
-                    self.valves.show_debug_log = False
+                    self._frontend_broadcast_broken = True
             else:
                 logger.error(f"Failed to process log to frontend: ValueError: {ve}")
         except Exception as e:

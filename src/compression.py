@@ -9,9 +9,15 @@ class CompressionMixin:
 
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         """Get or create an asyncio lock for a specific chat ID."""
-        if chat_id not in self._chat_locks:
-            self._chat_locks[chat_id] = asyncio.Lock()
-        return self._chat_locks[chat_id]
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            # Bound growth: drop idle locks once the map gets large.
+            if len(self._chat_locks) >= 128:
+                self._chat_locks = {
+                    cid: lk for cid, lk in self._chat_locks.items() if lk.locked()
+                }
+            lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+        return lock
 
     def _capture_pending_inlet_messages(
         self, chat_id: str, messages: List[Dict[str, Any]]
@@ -33,6 +39,12 @@ class CompressionMixin:
 
         if pending_messages:
             self._pending_inlet_messages[chat_id] = pending_messages
+            # Bound growth: entries hold deep-copied messages; drop the oldest
+            # chat's pending messages once the map gets large.
+            if len(self._pending_inlet_messages) > 64:
+                self._pending_inlet_messages.pop(
+                    next(iter(self._pending_inlet_messages)), None
+                )
         else:
             self._pending_inlet_messages.pop(chat_id, None)
 

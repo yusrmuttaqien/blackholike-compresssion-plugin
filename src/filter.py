@@ -24,6 +24,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         # Concurrency control: Lock per chat session
         self._chat_locks = {}
         self._pending_inlet_messages: Dict[str, List[Dict[str, Any]]] = {}
+        # Set when frontend broadcasting is unavailable; stops retrying without
+        # mutating the user-configurable show_debug_log valve.
+        self._frontend_broadcast_broken = False
         self._init_database()
     class Valves(BaseModel):
         priority: int = Field(

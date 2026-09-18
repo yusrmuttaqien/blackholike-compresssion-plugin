@@ -371,7 +371,9 @@ class SummarizeMixin:
                             next_context = [system_prompt_msg] + next_context
 
                     # 4. Calculate Tokens
-                    token_count = self._calculate_messages_tokens(next_context)
+                    token_count = await asyncio.to_thread(
+                        self._calculate_messages_tokens, next_context
+                    )
 
                     # 5. Get Thresholds & Calculate Ratio
                     model = self._clean_model_id(body.get("model"))

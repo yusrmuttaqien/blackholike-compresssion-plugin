@@ -84,13 +84,23 @@ Source of truth for findings: `assessment.md` (v2). Flow reference: `flows.md`.
 
 ## Phase 3 — Micro-fixes (behavior-preserving)
 
-- [ ] Item 16: shared module-level thread pool in `_call_db_sync` (`src/db.py:105`).
-- [ ] Item 17: bound `_chat_locks` and `_pending_inlet_messages`
-      (evict when idle/completed) — unbounded per-chat growth.
-- [ ] Item 18: wrap `_calculate_messages_tokens(next_context)` in
-      `asyncio.to_thread` for consistency (`src/summarize.py:379`).
-- [ ] Item 19: replace runtime mutation of `self.valves.show_debug_log`
-      with a proper runtime flag (`src/console.py:90`).
+- [x] Item 16: `_get_db_sync_pool()` — lazily created shared single-worker pool
+      (`thread_name_prefix="owui-db"`); `_call_db_sync` no longer creates a pool
+      per call (`src/db.py`).
+- [x] Item 17: bounded maps — `_get_chat_lock` drops idle locks once
+      `_chat_locks` reaches 128; `_capture_pending_inlet_messages` evicts the
+      oldest chat's pending messages once the map exceeds 64 (`src/compression.py`).
+- [x] Item 18: `_calculate_messages_tokens(next_context)` now runs via
+      `asyncio.to_thread` in the summary status path (`src/summarize.py`).
+- [x] Item 19: `self._frontend_broadcast_broken` flag (initialized in
+      `Filter.__init__`) replaces the runtime mutation of the
+      `show_debug_log` valve; gate moved to the emit choke point in
+      `_emit_frontend_console_log` (`src/console.py`, `src/filter.py`).
+
+> **Phase 3 complete: 3,794 → 3,825 lines (+31 — defensive code added on purpose:**
+> shared-pool helper, bound checks, broadcast flag).** Verified: build +
+> py_compile OK, diff = exactly the 4 fixes, no stale patterns.
+> Net across all three phases: 4,036 → 3,825 lines (−211).
 
 ---
 

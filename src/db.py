@@ -102,18 +102,30 @@ async def _call_db(method, *args, **kwargs):
         return method(*args, **kwargs)
 
 
+_db_sync_pool = None
+
+
+def _get_db_sync_pool():
+    """Shared single-worker pool for bridging async DB calls into sync contexts."""
+    global _db_sync_pool
+    if _db_sync_pool is None:
+        import concurrent.futures
+
+        _db_sync_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="owui-db"
+        )
+    return _db_sync_pool
+
+
 def _call_db_sync(method, *args, **kwargs):
     """
     Call an OpenWebUI DB model method with version-aware async handling (for sync contexts).
     - OpenWebUI <  0.9.0: DB methods are sync, call directly.
-    - OpenWebUI >= 0.9.0: DB methods are async, run in a separate thread with its own event loop.
+    - OpenWebUI >= 0.9.0: DB methods are async, run on a shared worker thread with its own event loop.
     """
     if not _owui_version_ge("0.9.0"):
         return method(*args, **kwargs)
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, method(*args, **kwargs)).result()
+    return _get_db_sync_pool().submit(asyncio.run, method(*args, **kwargs)).result()
 
 
 class ChatSummary(owui_Base):

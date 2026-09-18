@@ -135,6 +135,24 @@ flow-following bottlenecks. Split into verbatim-extracted helpers:
       external refs exist) — so the common no-refs path raised
       `UnboundLocalError`. Verified with a stubbed-import smoke test driving
       both helpers' no-refs path.
+- [x] 4.6 Distinguish the outlet status reading from the inlet's. The inlet
+      emissions (with-summary + no-summary branches) and the post-summary
+      emission all count the *full request* (system prompt + history), but
+      the outlet background check counts the saved conversation history only
+      (Open WebUI's outlet body never contains the model's system prompt), so
+      the two numbers per turn looked contradictory (e.g. 1552 → 8). Added
+      i18n key `status_history_usage` (en-US: "History Usage (Estimated): …",
+      zh-CN: "对话历史用量 (预估): …"), a `label_key` param on
+      `_emit_context_usage_status`, and the outlet site
+      (src/compression.py) now passes `label_key="status_history_usage"`.
+      The other three sites keep the default `status_context_usage` label.
+      Also added i18n key `status_compaction_drives` (en-US: " | (drives
+      compaction)", zh-CN: " | (触发压缩)") plus a `note_key` param on
+      `_emit_context_usage_status`; the outlet site passes
+      `note_key="status_compaction_drives"` to make explicit that the History
+      Usage reading — not the inlet's Context Usage reading — is the one the
+      compaction threshold checks against. Verified: build + py_compile OK,
+      exactly one call site uses the new keys.
 
 > **Phase 4 complete: 3,825 → 4,023 lines (+198 — helper signatures, docstrings,
 > and multi-line call wrapping; no logic added).** Verified: build + py_compile

@@ -68,6 +68,8 @@ from datetime import datetime, timezone
 TRANSLATIONS = {
     "en-US": {
         "status_context_usage": "Context Usage (Estimated): {tokens} / {max_tokens} Tokens ({ratio}%)",
+        "status_history_usage": "History Usage (Estimated): {tokens} / {max_tokens} Tokens ({ratio}%)",
+        "status_compaction_drives": " | (drives compaction)",
         "status_high_usage": " | ⚠️ High Usage",
         "status_loaded_summary": "Loaded historical summary (Hidden {count} historical messages)",
         "status_context_summary_updated": "Context Summary Updated: {tokens} / {max_tokens} Tokens ({ratio}%)",
@@ -81,6 +83,8 @@ TRANSLATIONS = {
     },
     "zh-CN": {
         "status_context_usage": "上下文用量 (预估): {tokens} / {max_tokens} Tokens ({ratio}%)",
+        "status_history_usage": "对话历史用量 (预估): {tokens} / {max_tokens} Tokens ({ratio}%)",
+        "status_compaction_drives": " | (触发压缩)",
         "status_high_usage": " | ⚠️ 用量较高",
         "status_loaded_summary": "已加载历史总结 (隐藏了 {count} 条历史消息)",
         "status_context_summary_updated": "上下文总结已更新: {tokens} / {max_tokens} Tokens ({ratio}%)",
@@ -1717,12 +1721,21 @@ class CompressionMixin:
                     event_call=__event_call__,
                 )
 
-            # Send status notification (Context Usage format)
+            # Send status notification (History Usage format — this count is
+            # the saved conversation history only, without the model's system
+            # prompt, so it is not directly comparable to the inlet's
+            # full-request Context Usage reading). It is also the reading the
+            # compaction threshold checks against, so mark it as such.
             max_context_tokens = thresholds.get(
                 "max_context_tokens", self.valves.max_context_tokens
             )
             await self._emit_context_usage_status(
-                current_tokens, max_context_tokens, lang, __event_emitter__
+                current_tokens,
+                max_context_tokens,
+                lang,
+                __event_emitter__,
+                label_key="status_history_usage",
+                note_key="status_compaction_drives",
             )
 
             # Check if compression is needed
@@ -3087,8 +3100,18 @@ class ConsoleMixin:
         max_context_tokens: int,
         lang: str,
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+        label_key: str = "status_context_usage",
+        note_key: Optional[str] = None,
     ) -> None:
-        """Emit the 'Context Usage' status notification if the usage ratio warrants it."""
+        """Emit a usage status notification if the usage ratio warrants it.
+
+        label_key selects which i18n template to use: 'status_context_usage'
+        for full-request counts (inlet, post-summary) and
+        'status_history_usage' for history-only counts (outlet background
+        check), so the two readings are not mistaken for each other.
+        note_key optionally appends a translated suffix (e.g. marking the
+        history reading as the one that drives compaction).
+        """
         if not __event_emitter__ or max_context_tokens <= 0:
             return
         usage_ratio = tokens / max_context_tokens
@@ -3096,13 +3119,15 @@ class ConsoleMixin:
             return
         status_msg = self._get_translation(
             lang,
-            "status_context_usage",
+            label_key,
             tokens=tokens,
             max_tokens=max_context_tokens,
             ratio=f"{usage_ratio * 100:.1f}",
         )
         if usage_ratio > 0.9:
             status_msg += self._get_translation(lang, "status_high_usage")
+        if note_key:
+            status_msg += self._get_translation(lang, note_key)
         await __event_emitter__(
             {"type": "status", "data": {"description": status_msg, "done": True}}
         )

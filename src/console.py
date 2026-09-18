@@ -132,8 +132,18 @@ class ConsoleMixin:
         max_context_tokens: int,
         lang: str,
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+        label_key: str = "status_context_usage",
+        note_key: Optional[str] = None,
     ) -> None:
-        """Emit the 'Context Usage' status notification if the usage ratio warrants it."""
+        """Emit a usage status notification if the usage ratio warrants it.
+
+        label_key selects which i18n template to use: 'status_context_usage'
+        for full-request counts (inlet, post-summary) and
+        'status_history_usage' for history-only counts (outlet background
+        check), so the two readings are not mistaken for each other.
+        note_key optionally appends a translated suffix (e.g. marking the
+        history reading as the one that drives compaction).
+        """
         if not __event_emitter__ or max_context_tokens <= 0:
             return
         usage_ratio = tokens / max_context_tokens
@@ -141,13 +151,15 @@ class ConsoleMixin:
             return
         status_msg = self._get_translation(
             lang,
-            "status_context_usage",
+            label_key,
             tokens=tokens,
             max_tokens=max_context_tokens,
             ratio=f"{usage_ratio * 100:.1f}",
         )
         if usage_ratio > 0.9:
             status_msg += self._get_translation(lang, "status_high_usage")
+        if note_key:
+            status_msg += self._get_translation(lang, note_key)
         await __event_emitter__(
             {"type": "status", "data": {"description": status_msg, "done": True}}
         )

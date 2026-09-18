@@ -583,12 +583,21 @@ class CompressionMixin:
                     event_call=__event_call__,
                 )
 
-            # Send status notification (Context Usage format)
+            # Send status notification (History Usage format — this count is
+            # the saved conversation history only, without the model's system
+            # prompt, so it is not directly comparable to the inlet's
+            # full-request Context Usage reading). It is also the reading the
+            # compaction threshold checks against, so mark it as such.
             max_context_tokens = thresholds.get(
                 "max_context_tokens", self.valves.max_context_tokens
             )
             await self._emit_context_usage_status(
-                current_tokens, max_context_tokens, lang, __event_emitter__
+                current_tokens,
+                max_context_tokens,
+                lang,
+                __event_emitter__,
+                label_key="status_history_usage",
+                note_key="status_compaction_drives",
             )
 
             # Check if compression is needed

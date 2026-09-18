@@ -417,6 +417,18 @@ class CompressionMixin:
 
         return thresholds.get("max_context_tokens", self.valves.max_context_tokens)
 
+    def _extract_system_from_params(self, params: Any) -> Optional[str]:
+        """Extract the 'system' prompt from model params (dict, JSON string, or object)."""
+        if isinstance(params, str):
+            params = json.loads(params)
+        elif hasattr(params, "model_dump"):
+            params = params.model_dump()
+        elif hasattr(params, "dict"):
+            params = params.dict()
+        if isinstance(params, dict):
+            return params.get("system")
+        return getattr(params, "system", None)
+
     def _get_chat_context(
         self, body: dict, __metadata__: Optional[dict] = None
     ) -> Dict[str, str]:
@@ -540,59 +552,32 @@ class CompressionMixin:
             )
 
             # --- Fast Estimation Check ---
-            estimated_tokens = self._estimate_messages_tokens(messages)
-
             # For triggering summary generation, we need to be more precise if we are in the grey zone
             # Margin is 15% (skip tiktoken if estimated is < 85% of threshold)
             # Note: We still use tiktoken if we exceed threshold, because we want an accurate usage status report
-            if estimated_tokens < compression_threshold_tokens * 0.85:
-                current_tokens = estimated_tokens
-                await self._log(
-                    "[🔍 Background Calculation] Full-history estimate below threshold\n"
-                    f"source_history_tokens_est={current_tokens} | compression_threshold_tokens={compression_threshold_tokens} | precise_count_skipped=true",
-                    event_call=__event_call__,
-                )
-            else:
-                # Calculate Token count precisely in a background thread
-                current_tokens = await asyncio.to_thread(
-                    self._calculate_messages_tokens, messages
-                )
+            current_tokens, _, used_precise = await self._resolve_context_tokens(
+                messages, compression_threshold_tokens
+            )
+            if used_precise:
                 await self._log(
                     "[🔍 Background Calculation] Full-history precise token count\n"
                     f"source_history_tokens={current_tokens}",
                     event_call=__event_call__,
                 )
+            else:
+                await self._log(
+                    "[🔍 Background Calculation] Full-history estimate below threshold\n"
+                    f"source_history_tokens_est={current_tokens} | compression_threshold_tokens={compression_threshold_tokens} | precise_count_skipped=true",
+                    event_call=__event_call__,
+                )
 
             # Send status notification (Context Usage format)
-            if __event_emitter__:
-                max_context_tokens = thresholds.get(
-                    "max_context_tokens", self.valves.max_context_tokens
-                )
-                if max_context_tokens > 0:
-                    usage_ratio = current_tokens / max_context_tokens
-                    # Only show status if threshold is met
-                    if self._should_show_status(usage_ratio):
-                        status_msg = self._get_translation(
-                            lang,
-                            "status_context_usage",
-                            tokens=current_tokens,
-                            max_tokens=max_context_tokens,
-                            ratio=f"{usage_ratio*100:.1f}",
-                        )
-                        if usage_ratio > 0.9:
-                            status_msg += self._get_translation(
-                                lang, "status_high_usage"
-                            )
-
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": status_msg,
-                                    "done": True,
-                                },
-                            }
-                        )
+            max_context_tokens = thresholds.get(
+                "max_context_tokens", self.valves.max_context_tokens
+            )
+            await self._emit_context_usage_status(
+                current_tokens, max_context_tokens, lang, __event_emitter__
+            )
 
             # Check if compression is needed
             if current_tokens >= compression_threshold_tokens:

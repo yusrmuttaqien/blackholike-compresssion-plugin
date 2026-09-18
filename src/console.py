@@ -123,3 +123,29 @@ class ConsoleMixin:
         # Check if usage exceeds threshold
         threshold_ratio = self.valves.token_usage_status_threshold / 100.0
         return usage_ratio >= threshold_ratio
+
+    async def _emit_context_usage_status(
+        self,
+        tokens: int,
+        max_context_tokens: int,
+        lang: str,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> None:
+        """Emit the 'Context Usage' status notification if the usage ratio warrants it."""
+        if not __event_emitter__ or max_context_tokens <= 0:
+            return
+        usage_ratio = tokens / max_context_tokens
+        if not self._should_show_status(usage_ratio):
+            return
+        status_msg = self._get_translation(
+            lang,
+            "status_context_usage",
+            tokens=tokens,
+            max_tokens=max_context_tokens,
+            ratio=f"{usage_ratio * 100:.1f}",
+        )
+        if usage_ratio > 0.9:
+            status_msg += self._get_translation(lang, "status_high_usage")
+        await __event_emitter__(
+            {"type": "status", "data": {"description": status_msg, "done": True}}
+        )

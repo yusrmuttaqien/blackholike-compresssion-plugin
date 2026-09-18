@@ -227,6 +227,39 @@ class ToolCallMixin:
 
         return groups
 
+    def _drop_oldest_atomic_group(
+        self,
+        trimmable: List[Dict],
+        group_indices: List[int],
+        count_precise: bool,
+        preserve_protected: bool,
+        preserved_systems: Optional[List[Dict]],
+    ) -> int:
+        """
+        Drop the oldest atomic group from the front of `trimmable`.
+        When `preserve_protected` is set, external-reference messages stop the
+        drop (re-inserted at the front) and system messages are moved to
+        `preserved_systems` instead of being counted.
+        Returns the number of tokens dropped.
+        """
+        dropped_tokens = 0
+        for _ in range(len(group_indices)):
+            dropped = trimmable.pop(0)
+            if preserve_protected:
+                if self._is_external_reference_message(dropped):
+                    trimmable.insert(0, dropped)
+                    break
+                if isinstance(dropped, dict) and dropped.get("role") == "system":
+                    preserved_systems.append(dropped)
+                    continue
+            if count_precise:
+                dropped_tokens += self._count_tokens(str(dropped.get("content", "")))
+            else:
+                dropped_tokens += self._estimate_content_tokens(
+                    dropped.get("content", "")
+                )
+        return dropped_tokens
+
     def _align_tail_start_to_atomic_boundary(
         self, messages: List[Dict], raw_start_index: int, protected_prefix: int
     ) -> int:

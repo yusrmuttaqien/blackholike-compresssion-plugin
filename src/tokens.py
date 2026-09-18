@@ -212,3 +212,20 @@ class TokenMixin:
             total_tokens += self._estimate_content_tokens(msg.get("content", ""))
 
         return total_tokens
+
+    async def _resolve_context_tokens(
+        self, messages: List[Dict], limit_tokens: int
+    ) -> tuple[int, int, bool]:
+        """
+        Count message tokens with a fast path: use the heuristic estimate when
+        it is clearly below `limit_tokens` (within a 15% margin); otherwise
+        fall back to a precise tiktoken count in a worker thread.
+        Returns (total_tokens, estimated_tokens, used_precise_count).
+        """
+        estimated_tokens = self._estimate_messages_tokens(messages)
+        if limit_tokens > 0 and estimated_tokens < limit_tokens * 0.85:
+            return estimated_tokens, estimated_tokens, False
+        precise_tokens = await asyncio.to_thread(
+            self._calculate_messages_tokens, messages
+        )
+        return precise_tokens, estimated_tokens, True

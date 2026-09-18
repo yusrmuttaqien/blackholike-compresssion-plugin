@@ -60,15 +60,25 @@ Source of truth for findings: `assessment.md` (v2). Flow reference: `flows.md`.
 
 ## Phase 2 — Dedup refactors (behavior-preserving, ~150 lines)
 
-- [ ] Item 9: `_emit_usage_status(tokens, max_tokens, lang, emitter)` helper — 4 call sites
-      (`src/compression.py`, `src/summarize.py`, `src/filter.py` ×2).
-- [ ] Item 10: shared "estimate → precise count if within 15% of limit" helper — 3 call sites.
-- [ ] Item 11: shared "system prompt from model params" helper — 2 call sites
-      (`src/filter.py`, `src/summarize.py`).
-- [ ] Item 12: merge the two drop-oldest-atomic-groups loops in `inlet`
-      (`src/filter.py:498,720`).
-- [ ] Item 13: decide `inlet`'s `target_compressed_count` — keep (single log line)
-      or drop the computation.
+- [x] Item 9: `_emit_context_usage_status(tokens, max_tokens, lang, emitter)` helper in
+      `src/console.py` — all 4 call sites converted (`src/compression.py`,
+      `src/summarize.py`, `src/filter.py` ×2).
+- [x] Item 10: `_resolve_context_tokens(messages, limit)` in `src/tokens.py` returns
+      `(total, estimated, used_precise)` — 3 call sites converted; also replaced the
+      fragile `total_tokens == estimated_tokens` equality checks with `used_precise`.
+- [x] Item 11: `_extract_system_from_params(params)` in `src/compression.py` — both
+      call sites converted (`src/filter.py`, `src/summarize.py`).
+- [x] Item 12: `_drop_oldest_atomic_group(...)` in `src/toolcalls.py` — both inlet
+      loops converted (`preserve_protected=False/True` covers the system/external-ref
+      protection difference).
+- [x] Item 13: `target_compressed_count` — **kept** (O(n) index walk, feeds one useful
+      boundary log line on every inlet request).
+
+> **Phase 2 complete: 3,860 → 3,794 lines (−66; ~150 lines of duplication removed,
+> offset by 4 new helpers).** Verified: build + py_compile OK, method-set diff =
+> exactly 4 helpers added / 0 removed, all `self._*` calls resolve, full line-by-line
+> diff reviewed. One cleanup bonus: `used_precise` flag replaces the
+> `total == estimated` coincidence checks in the drop loops and stats block.
 
 ---
 

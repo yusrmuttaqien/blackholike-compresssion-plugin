@@ -211,23 +211,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
 
                     if model_obj.params:
                         try:
-                            params = model_obj.params
-                            # Handle case where params is a JSON string
-                            if isinstance(params, str):
-                                params = json.loads(params)
-                            # Convert Pydantic model to dict if needed
-                            elif hasattr(params, "model_dump"):
-                                params = params.model_dump()
-                            elif hasattr(params, "dict"):
-                                params = params.dict()
-
-                            # Now params should be a dict
-                            if isinstance(params, dict):
-                                system_prompt_content = params.get("system")
-                            else:
-                                # Fallback: try getattr
-                                system_prompt_content = getattr(params, "system", None)
-
+                            system_prompt_content = self._extract_system_from_params(
+                                model_obj.params
+                            )
                             if system_prompt_content:
                                 if self.valves.show_debug_log and __event_call__:
                                     await self._log(
@@ -457,29 +443,23 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             )
 
             # --- Fast Estimation Check ---
-            estimated_tokens = self._estimate_messages_tokens(calc_messages)
-
             # Since this is a hard limit check, only skip precise calculation if we are far below it (margin of 15%)
             # max_context_tokens == 0 means "no limit", skip reduction entirely
+            total_tokens, estimated_tokens, used_precise = (
+                await self._resolve_context_tokens(calc_messages, max_context_tokens)
+            )
             if max_context_tokens <= 0:
-                total_tokens = estimated_tokens
                 await self._log(
                     f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
                     event_call=__event_call__,
                 )
-            elif estimated_tokens < max_context_tokens * 0.85:
-                total_tokens = estimated_tokens
+            elif not used_precise:
                 await self._log(
                     "[Inlet] 🔎 Sent-context preflight (estimated)\n"
                     f"sent_context_tokens={total_tokens} | max_context_tokens={max_context_tokens} | status=well_within_limit",
                     event_call=__event_call__,
                 )
             else:
-                # Calculate exact total tokens via tiktoken
-                total_tokens = await asyncio.to_thread(
-                    self._calculate_messages_tokens, calc_messages
-                )
-
                 # Preflight Check Log
                 await self._log(
                     "[Inlet] 🔎 Sent-context preflight (precise)\n"
@@ -491,29 +471,16 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 atomic_groups = self._get_atomic_groups(tail_messages)
 
                 while total_tokens > max_context_tokens and len(atomic_groups) > 1:
-                    # Strategy 1: Structure-Aware Assistant Trimming (Optional, only for non-tool messages)
-                    # For simplicity and reliability in this fix, we prioritize Group-Drop over partial trim
-                    # if a group contains tool calls.
-
-                    # Strategy 2: Drop Oldest Atomic Group Entirely
+                    # Drop the oldest atomic group entirely (never cut through a
+                    # tool-calling block).
                     dropped_group_indices = atomic_groups.pop(0)
-                    # Note: indices in dropped_group_indices are relative to ORIGINAL tail_messages
-                    # But since we are popping from tail_messages itself, we need to be careful.
-
-                    # Extract and drop messages in this group from the actual list
-                    # Since we always pop group 0, we pop len(dropped_group_indices) times from front
-                    dropped_tokens = 0
-                    for _ in range(len(dropped_group_indices)):
-                        dropped = tail_messages.pop(0)
-                        if total_tokens == estimated_tokens:
-                            dropped_tokens += self._estimate_content_tokens(
-                                dropped.get("content", "")
-                            )
-                        else:
-                            dropped_tokens += self._count_tokens(
-                                str(dropped.get("content", ""))
-                            )
-
+                    dropped_tokens = self._drop_oldest_atomic_group(
+                        tail_messages,
+                        dropped_group_indices,
+                        used_precise,
+                        preserve_protected=False,
+                        preserved_systems=None,
+                    )
                     total_tokens -= dropped_tokens
 
                     if self.valves.show_debug_log and __event_call__:
@@ -540,7 +507,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
 
             # Calculate detailed token stats for logging
             summary_content = summary_msg.get("content", "")
-            if total_tokens == estimated_tokens:
+            if not used_precise:
                 system_tokens = (
                     self._estimate_content_tokens(system_prompt_msg.get("content", ""))
                     if system_prompt_msg
@@ -588,29 +555,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
 
             # Prepare status message (Context Usage format)
             if max_context_tokens > 0:
-                usage_ratio = total_section_tokens / max_context_tokens
-                # Only show status if threshold is met
-                if self._should_show_status(usage_ratio):
-                    status_msg = self._get_translation(
-                        lang,
-                        "status_context_usage",
-                        tokens=total_section_tokens,
-                        max_tokens=max_context_tokens,
-                        ratio=f"{usage_ratio*100:.1f}",
-                    )
-                    if usage_ratio > 0.9:
-                        status_msg += self._get_translation(lang, "status_high_usage")
-
-                    if __event_emitter__:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": status_msg,
-                                    "done": True,
-                                },
-                            }
-                        )
+                await self._emit_context_usage_status(
+                    total_section_tokens, max_context_tokens, lang, __event_emitter__
+                )
             else:
                 # For the case where max_context_tokens is 0, show summary info without threshold check
                 if self.valves.show_token_usage_status and __event_emitter__:
@@ -681,25 +628,20 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             )
 
             # --- Fast Estimation Check ---
-            estimated_tokens = self._estimate_messages_tokens(calc_messages)
-
             # Only skip precise calculation if we are clearly below the limit
             # max_context_tokens == 0 means "no limit", skip reduction entirely
+            total_tokens, estimated_tokens, used_precise = (
+                await self._resolve_context_tokens(calc_messages, max_context_tokens)
+            )
             if max_context_tokens <= 0:
-                total_tokens = estimated_tokens
                 await self._log(
                     f"[Inlet] 🔎 No max_context_tokens limit set (0). Skipping reduction. Est: {total_tokens}t",
                     event_call=__event_call__,
                 )
-            elif estimated_tokens < max_context_tokens * 0.85:
-                total_tokens = estimated_tokens
+            elif not used_precise:
                 await self._log(
                     f"[Inlet] 🔎 Fast limit check (Est): {total_tokens}t / {max_context_tokens}t",
                     event_call=__event_call__,
-                )
-            else:
-                total_tokens = await asyncio.to_thread(
-                    self._calculate_messages_tokens, calc_messages
                 )
 
             if total_tokens > max_context_tokens and max_context_tokens > 0:
@@ -717,39 +659,18 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 # system messages that were part of dropped groups.
                 dropped_but_preserved_systems = []
 
+                # Absolute protections when dropping groups:
+                # 1. External references (often large and specialized)
+                # 2. System messages (instructions)
                 while total_tokens > max_context_tokens and len(atomic_groups) > 1:
                     dropped_group_indices = atomic_groups.pop(0)
-                    dropped_tokens = 0
-                    for _ in range(len(dropped_group_indices)):
-                        dropped = trimmable.pop(0)
-
-                        # Absolute protections:
-                        # 1. External references (often large and specialized)
-                        # 2. System messages (instructions)
-                        if self._is_external_reference_message(dropped):
-                            trimmable.insert(0, dropped)
-                            # Stop dropping this group if we hit a protected message
-                            # (Though groups should be pure, this is a safety net)
-                            break
-
-                        if (
-                            isinstance(dropped, dict)
-                            and dropped.get("role") == "system"
-                        ):
-                            dropped_but_preserved_systems.append(dropped)
-                            # Even if preserved, it counts as "dropped" from the trimmable flow
-                            # to avoid infinite loop, but its tokens remain in the budget.
-                            # We don't subtract its tokens here.
-                            continue
-
-                        if total_tokens == estimated_tokens:
-                            dropped_tokens += self._estimate_content_tokens(
-                                dropped.get("content", "")
-                            )
-                        else:
-                            dropped_tokens += self._count_tokens(
-                                str(dropped.get("content", ""))
-                            )
+                    dropped_tokens = self._drop_oldest_atomic_group(
+                        trimmable,
+                        dropped_group_indices,
+                        used_precise,
+                        preserve_protected=True,
+                        preserved_systems=dropped_but_preserved_systems,
+                    )
                     total_tokens -= dropped_tokens
 
                 # Re-assemble: [Head] + [Preserved Systems from Dropped Groups] + [Remaining Trimmable/Tail]
@@ -765,30 +686,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                 )
 
             # Send status notification (Context Usage format)
-            if max_context_tokens > 0:
-                usage_ratio = total_tokens / max_context_tokens
-                # Only show status if threshold is met
-                if self._should_show_status(usage_ratio):
-                    status_msg = self._get_translation(
-                        lang,
-                        "status_context_usage",
-                        tokens=total_tokens,
-                        max_tokens=max_context_tokens,
-                        ratio=f"{usage_ratio*100:.1f}",
-                    )
-                    if usage_ratio > 0.9:
-                        status_msg += self._get_translation(lang, "status_high_usage")
-
-                    if __event_emitter__:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": status_msg,
-                                    "done": True,
-                                },
-                            }
-                        )
+            await self._emit_context_usage_status(
+                total_tokens, max_context_tokens, lang, __event_emitter__
+            )
 
         body["messages"] = final_messages
         self._capture_pending_inlet_messages(chat_id, final_messages)

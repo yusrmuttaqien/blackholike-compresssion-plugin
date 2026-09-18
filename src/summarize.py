@@ -326,14 +326,9 @@ class SummarizeMixin:
                         try:
                             model_obj = await _call_db(Models.get_model_by_id, model_id)
                             if model_obj and model_obj.params:
-                                params = model_obj.params
-                                if isinstance(params, str):
-                                    params = json.loads(params)
-                                if isinstance(params, dict):
-                                    sys_content = params.get("system")
-                                else:
-                                    sys_content = getattr(params, "system", None)
-
+                                sys_content = self._extract_system_from_params(
+                                    model_obj.params
+                                )
                                 if sys_content:
                                     system_prompt_msg = {
                                         "role": "system",
@@ -385,31 +380,9 @@ class SummarizeMixin:
                         "max_context_tokens", self.valves.max_context_tokens
                     )
                     # 6. Emit Status (only if threshold is met)
-                    if max_context_tokens > 0:
-                        usage_ratio = token_count / max_context_tokens
-                        # Only show status if threshold is met
-                        if self._should_show_status(usage_ratio):
-                            status_msg = self._get_translation(
-                                lang,
-                                "status_context_usage",
-                                tokens=token_count,
-                                max_tokens=max_context_tokens,
-                                ratio=f"{usage_ratio*100:.1f}",
-                            )
-                            if usage_ratio > 0.9:
-                                status_msg += self._get_translation(
-                                    lang, "status_high_usage"
-                                )
-
-                            await __event_emitter__(
-                                {
-                                    "type": "status",
-                                    "data": {
-                                        "description": status_msg,
-                                        "done": True,
-                                    },
-                                }
-                            )
+                    await self._emit_context_usage_status(
+                        token_count, max_context_tokens, lang, __event_emitter__
+                    )
                 except Exception as e:
                     await self._log(
                         f"[Status] Error calculating tokens: {e}",

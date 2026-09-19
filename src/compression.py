@@ -366,9 +366,13 @@ class CompressionMixin:
         """Gets threshold configuration for a specific model.
 
         Priority:
-        1. If configuration exists for the model ID in model_thresholds, use it.
-        2. If model is a custom model, try to match its base_model_id.
-        3. Otherwise, use global parameters compression_threshold_tokens and max_context_tokens.
+        1. If configuration exists for the model ID in model_thresholds,
+           use it (direct match or via base_model_id for custom models).
+           These are absolute token counts and win over everything else.
+        2. Otherwise, the max context is resolved from the model API when
+           available (see contextlength.py), falling back to the global
+           max_context_tokens valve. The compression threshold is
+           compression_threshold_percent of that resolved max context.
         """
         parsed = self._parse_model_thresholds()
 
@@ -379,6 +383,7 @@ class CompressionMixin:
             return parsed[model_id]
 
         # 2. Try to find base_model_id for custom models
+        model_obj = None
         try:
             model_obj = _call_db_sync(Models.get_model_by_id, model_id)
             if model_obj:
@@ -406,15 +411,32 @@ class CompressionMixin:
                     f"[Config] Failed to lookup base_model for '{model_id}': {e}"
                 )
 
-        # 3. Use global default configuration
-        if self.valves.debug_mode:
-            logger.info(
-                f"[Config] Model {model_id} not in model_thresholds, using global parameters"
-            )
+        # 3. Resolve max context: model-reported value first, global valve
+        #    as fallback. The compression threshold is a percentage of
+        #    the resolved max context, so it scales with the model.
+        max_context_tokens = self.valves.max_context_tokens
+        reported = _resolve_reported_context_length(model_id, model_obj)
+        if reported is not None:
+            max_context_tokens = reported
+            if self.valves.debug_mode:
+                logger.info(
+                    f"[Config] Model '{model_id}' reports context_length={reported}; "
+                    f"using it over the global max_context_tokens valve"
+                )
+        else:
+            if self.valves.debug_mode:
+                logger.info(
+                    f"[Config] Model '{model_id}' not in model_thresholds and no "
+                    f"reported context length; using global parameters"
+                )
+
+        compression_threshold_tokens = int(
+            max_context_tokens * self.valves.compression_threshold_percent / 100
+        )
 
         return {
-            "compression_threshold_tokens": self.valves.compression_threshold_tokens,
-            "max_context_tokens": self.valves.max_context_tokens,
+            "compression_threshold_tokens": compression_threshold_tokens,
+            "max_context_tokens": max_context_tokens,
         }
 
     def _get_summary_model_context_limit(self, model_id: Optional[str]) -> int:
@@ -555,7 +577,12 @@ class CompressionMixin:
             # Get threshold configuration for current model
             thresholds = self._get_model_thresholds(model) or {}
             compression_threshold_tokens = thresholds.get(
-                "compression_threshold_tokens", self.valves.compression_threshold_tokens
+                "compression_threshold_tokens",
+                int(
+                    self.valves.max_context_tokens
+                    * self.valves.compression_threshold_percent
+                    / 100
+                ),
             )
 
             await self._log(
@@ -600,8 +627,10 @@ class CompressionMixin:
                 note_key="status_compaction_drives",
             )
 
-            # Check if compression is needed
-            if current_tokens >= compression_threshold_tokens:
+            # Check if compression is needed. A threshold of 0 means the
+            # max context is unknown (no valve value, no reported value),
+            # in which case we never trigger on the threshold alone.
+            if compression_threshold_tokens > 0 and current_tokens >= compression_threshold_tokens:
                 await self._log(
                     "[🔍 Background Calculation] ⚡ Full-history threshold triggered\n"
                     f"source_history_tokens={current_tokens} | compression_threshold_tokens={compression_threshold_tokens}",

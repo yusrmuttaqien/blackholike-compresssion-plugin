@@ -741,6 +741,106 @@ class DBMixin:
             return record.summary
         return None
 
+# ── contextlength.py · Model-reported context length resolution ───────
+# Fragment: relies on shared imports/constants from _header.py.
+# Not importable standalone — assembled into v1.6.1.py by build.py.
+#
+# A model's max context is taken from the model API wherever possible
+# instead of the global valve. Open WebUI stores the model object the
+# API returned in the model's `meta`, so for OpenAI-compatible APIs
+# (OpenAI, llama.cpp server, vLLM, LM Studio, OpenRouter, ...) no live
+# query is needed — `meta.context_length` is authoritative.
+#
+# To support a new API type:
+#   1. Write a resolver: (model_id, model_obj) -> Optional[int]
+#   2. Register it in _CONTEXT_LENGTH_RESOLVERS under the API type name.
+
+
+def _resolve_context_length_openai_api(model_id, model_obj) -> Optional[int]:
+    """OpenAI-compatible: Open WebUI stores the /v1/models payload in meta.
+
+    Field precedence: `context_length` (OpenAI standard) then `n_ctx`
+    (llama.cpp — the slot context size the server enforces; `n_ctx_train`
+    is the trained size and is deliberately ignored). Both are checked at
+    the meta top level and one level down under 'meta': llama.cpp nests
+    its fields in a 'meta' sub-object, and Open WebUI flattens them into
+    the model meta on import, so either shape may occur.
+    """
+
+    def _pick(source):
+        if not isinstance(source, dict):
+            return None
+        for key in ("context_length", "n_ctx"):
+            value = source.get(key)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and value > 0
+            ):
+                return int(value)
+        return None
+
+    meta = getattr(model_obj, "meta", None)
+    nested = meta.get("meta") if isinstance(meta, dict) else None
+    return _pick(meta) or _pick(nested)
+
+
+# API type -> resolver. Add entries here when supporting new API types
+# (e.g. "ollama": ... once an Ollama /api/show resolver exists).
+_CONTEXT_LENGTH_RESOLVERS = {
+    "openai_api": _resolve_context_length_openai_api,
+}
+
+# API types known to Open WebUI connections, used for model-id prefix
+# detection below.
+_KNOWN_API_TYPES = frozenset(
+    {
+        "openai_api",
+        "ollama",
+        "openrouter",
+        "lm_studio",
+        "vllm",
+        "groq",
+        "mistral",
+        "anthropic",
+        "gemini",
+        "bedrock",
+    }
+)
+
+
+def _detect_api_type(model_id: str) -> str:
+    """Best-effort detection of a model's API type.
+
+    Connection model ids are namespaced as 'connection_name/model_id'
+    and default connection names match the API type. When no prefix
+    match is found, assume OpenAI-compatible (the default for custom
+    connections). A Connections-table lookup can replace this later if
+    renamed connections prove to be a problem.
+    """
+    prefix = model_id.split("/", 1)[0] if "/" in model_id else ""
+    if prefix in _KNOWN_API_TYPES:
+        return prefix
+    return "openai_api"
+
+
+def _resolve_reported_context_length(model_id: str, model_obj) -> Optional[int]:
+    """Query the registered resolver for the model's max context tokens.
+
+    Returns None when the model/API does not report one; callers fall
+    back to the global max_context_tokens valve.
+    """
+    if model_obj is None:
+        return None
+    api_type = _detect_api_type(model_id)
+    resolver = _CONTEXT_LENGTH_RESOLVERS.get(
+        api_type, _resolve_context_length_openai_api
+    )
+    try:
+        return resolver(model_id, model_obj)
+    except Exception:
+        return None
+
 # ── toolcalls.py · Native tool-call normalization, trimming, atomic grouping 
 # Fragment: relies on shared imports/constants from _header.py.
 # Not importable standalone — assembled into v1.6.1.py by build.py.
@@ -1504,9 +1604,13 @@ class CompressionMixin:
         """Gets threshold configuration for a specific model.
 
         Priority:
-        1. If configuration exists for the model ID in model_thresholds, use it.
-        2. If model is a custom model, try to match its base_model_id.
-        3. Otherwise, use global parameters compression_threshold_tokens and max_context_tokens.
+        1. If configuration exists for the model ID in model_thresholds,
+           use it (direct match or via base_model_id for custom models).
+           These are absolute token counts and win over everything else.
+        2. Otherwise, the max context is resolved from the model API when
+           available (see contextlength.py), falling back to the global
+           max_context_tokens valve. The compression threshold is
+           compression_threshold_percent of that resolved max context.
         """
         parsed = self._parse_model_thresholds()
 
@@ -1517,6 +1621,7 @@ class CompressionMixin:
             return parsed[model_id]
 
         # 2. Try to find base_model_id for custom models
+        model_obj = None
         try:
             model_obj = _call_db_sync(Models.get_model_by_id, model_id)
             if model_obj:
@@ -1544,15 +1649,32 @@ class CompressionMixin:
                     f"[Config] Failed to lookup base_model for '{model_id}': {e}"
                 )
 
-        # 3. Use global default configuration
-        if self.valves.debug_mode:
-            logger.info(
-                f"[Config] Model {model_id} not in model_thresholds, using global parameters"
-            )
+        # 3. Resolve max context: model-reported value first, global valve
+        #    as fallback. The compression threshold is a percentage of
+        #    the resolved max context, so it scales with the model.
+        max_context_tokens = self.valves.max_context_tokens
+        reported = _resolve_reported_context_length(model_id, model_obj)
+        if reported is not None:
+            max_context_tokens = reported
+            if self.valves.debug_mode:
+                logger.info(
+                    f"[Config] Model '{model_id}' reports context_length={reported}; "
+                    f"using it over the global max_context_tokens valve"
+                )
+        else:
+            if self.valves.debug_mode:
+                logger.info(
+                    f"[Config] Model '{model_id}' not in model_thresholds and no "
+                    f"reported context length; using global parameters"
+                )
+
+        compression_threshold_tokens = int(
+            max_context_tokens * self.valves.compression_threshold_percent / 100
+        )
 
         return {
-            "compression_threshold_tokens": self.valves.compression_threshold_tokens,
-            "max_context_tokens": self.valves.max_context_tokens,
+            "compression_threshold_tokens": compression_threshold_tokens,
+            "max_context_tokens": max_context_tokens,
         }
 
     def _get_summary_model_context_limit(self, model_id: Optional[str]) -> int:
@@ -1693,7 +1815,12 @@ class CompressionMixin:
             # Get threshold configuration for current model
             thresholds = self._get_model_thresholds(model) or {}
             compression_threshold_tokens = thresholds.get(
-                "compression_threshold_tokens", self.valves.compression_threshold_tokens
+                "compression_threshold_tokens",
+                int(
+                    self.valves.max_context_tokens
+                    * self.valves.compression_threshold_percent
+                    / 100
+                ),
             )
 
             await self._log(
@@ -1738,8 +1865,10 @@ class CompressionMixin:
                 note_key="status_compaction_drives",
             )
 
-            # Check if compression is needed
-            if current_tokens >= compression_threshold_tokens:
+            # Check if compression is needed. A threshold of 0 means the
+            # max context is unknown (no valve value, no reported value),
+            # in which case we never trigger on the threshold alone.
+            if compression_threshold_tokens > 0 and current_tokens >= compression_threshold_tokens:
                 await self._log(
                     "[🔍 Background Calculation] ⚡ Full-history threshold triggered\n"
                     f"source_history_tokens={current_tokens} | compression_threshold_tokens={compression_threshold_tokens}",
@@ -3167,19 +3296,20 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             default=10, description="Priority level for the filter operations."
         )
         # Token related parameters
-        compression_threshold_tokens: int = Field(
-            default=64000,
+        compression_threshold_percent: float = Field(
+            default=80.0,
             ge=0,
-            description="When total context Token count exceeds this value, trigger compression (Global Default)",
+            le=100,
+            description="Trigger compression when total context reaches this percentage (0-100) of the resolved max context. Resolution order: per-model override → model-reported context length → global max_context_tokens.",
         )
         max_context_tokens: int = Field(
             default=128000,
             ge=0,
-            description="Hard limit for context. Exceeding this value will force removal of earliest messages (Global Default)",
+            description="Hard limit for context (global fallback). Used only when the model doesn't report its own context length — OpenAI-compatible APIs report context_length, which takes precedence. Exceeding this value forces removal of earliest messages.",
         )
         model_thresholds: str = Field(
             default="",
-            description="Per-model threshold overrides. Format: model_id:compression_threshold:max_context (comma-separated). Example: gpt-4:8000:32000, claude-3:100000:200000",
+            description="Per-model overrides (highest priority). Format: model_id:compression_threshold:max_context (comma-separated). Absolute token counts; win over model-reported values and global settings. Example: gpt-4:8000:32000, claude-3:100000:200000",
         )
 
         keep_first: int = Field(

@@ -33,19 +33,20 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             default=10, description="Priority level for the filter operations."
         )
         # Token related parameters
-        compression_threshold_tokens: int = Field(
-            default=64000,
+        compression_threshold_percent: float = Field(
+            default=80.0,
             ge=0,
-            description="When total context Token count exceeds this value, trigger compression (Global Default)",
+            le=100,
+            description="Trigger compression when total context reaches this percentage (0-100) of the resolved max context. Resolution order: per-model override → model-reported context length → global max_context_tokens.",
         )
         max_context_tokens: int = Field(
             default=128000,
             ge=0,
-            description="Hard limit for context. Exceeding this value will force removal of earliest messages (Global Default)",
+            description="Hard limit for context (global fallback). Used only when the model doesn't report its own context length — OpenAI-compatible APIs report context_length, which takes precedence. Exceeding this value forces removal of earliest messages.",
         )
         model_thresholds: str = Field(
             default="",
-            description="Per-model threshold overrides. Format: model_id:compression_threshold:max_context (comma-separated). Example: gpt-4:8000:32000, claude-3:100000:200000",
+            description="Per-model overrides (highest priority). Format: model_id:compression_threshold:max_context (comma-separated). Absolute token counts; win over model-reported values and global settings. Example: gpt-4:8000:32000, claude-3:100000:200000",
         )
 
         keep_first: int = Field(

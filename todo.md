@@ -170,6 +170,70 @@ flow-following bottlenecks. Split into verbatim-extracted helpers:
 > no-summary returns messages as-is; with-summary injects the summary as
 > the first assistant message.
 
+## Phase 5 — Model-reported context length + percentage threshold
+
+Goal: stop relying on the global `max_context_tokens` valve alone — resolve
+the max context from the model API where possible (OpenAI-compatible first,
+extensible to other API types), and express the compression threshold as a
+percentage of the resolved max context.
+
+- [x] 5.1 New fragment `src/contextlength.py` (registered in build.py after
+      `db`): `_resolve_context_length_openai_api` reads `meta.context_length`
+      (Open WebUI stores the `/v1/models` payload in model meta — no live
+      query needed); `_CONTEXT_LENGTH_RESOLVERS` registry keyed by API type;
+      `_detect_api_type` (model-id prefix match against known connection API
+      types, default `openai_api`); `_resolve_reported_context_length`
+      entry point returning `Optional[int]`.
+- [x] 5.2 `_get_model_thresholds` restructured (src/compression.py): the
+      `Models.get_model_by_id` lookup result is now reused for both the
+      base_model_id match and the reported-context resolution (no extra DB
+      call). New chain: per-model override (absolute, wins) →
+      model-reported `context_length` → global `max_context_tokens` valve.
+      Threshold = `compression_threshold_percent` of the resolved max
+      context, rounded with `int()`.
+- [x] 5.3 Valves (src/filter.py): **removed** absolute
+      `compression_threshold_tokens` (was default 64000); **added**
+      `compression_threshold_percent: float` (default 80, ge=0 le=100).
+      Descriptions rewritten: `max_context_tokens` documented as global
+      fallback, `model_thresholds` documented as highest-priority absolute
+      overrides.
+- [x] 5.4 Outlet threshold check (src/compression.py): fallback default for
+      a missing dict key recomputed as percent × valve max (no reference to
+      the removed valve); trigger now guarded by
+      `compression_threshold_tokens > 0` so an unknown max context (0) never
+      triggers on the threshold alone.
+- [x] 5.5 Verified: build + py_compile (4,164 lines, 11 fragments), no stale
+      `valves.compression_threshold_tokens` refs, stubbed-import smoke test
+      — 10/10 pass: reported meta → 80% threshold (4096 → 3276), empty meta
+      / unknown model → valve fallback (128000 → 102400), per-model
+      override wins (absolute), base_model_id match, custom percent (50 →
+      2048), API-type detection (openai_api / custom-conn default / ollama
+      prefix), string `context_length` → fallback.
+
+- [x] 5.6 `n_ctx` support (found via the user's live install): the user's
+      llama.cpp server returns llama fields in a nested `meta` sub-object
+      (`meta.n_ctx`), and Open WebUI 0.11.3 flattens them into the model
+      meta on import — but never produces a standard `context_length`.
+      `_resolve_context_length_openai_api` now checks `context_length` then
+      `n_ctx`, at the meta top level and one level down under `meta`
+      (`n_ctx_train` deliberately ignored — it's the trained size, not the
+      enforced slot limit). Verified against the real DB: 5 of 95 models
+      carry `n_ctx` (the local llama.cpp models, 50176–262144), zero carry
+      `context_length`. Smoke test extended to 14/14 (flattened `n_ctx`,
+      nested `meta.n_ctx`, `context_length` precedence, `n_ctx_train`
+      ignored).
+
+**Behavior change:** the global threshold is no longer a fixed 64k — it is
+80% of the resolved max context (102.4k on the 128k default valve). Models
+that report a small context (e.g. llama.cpp at 4k) now trigger the summary
+path at 3.2k instead of never; users who had set an absolute threshold
+should move it to `model_thresholds` per-model overrides.
+
+**Known limitation:** the stored `n_ctx` is a snapshot from when the model
+was imported into Open WebUI. Restarting llama.cpp with a different slot
+context size (`-c`) won't update it until the model is re-imported — a
+live `/v1/models` query would fix that (deferred, see decision 3).
+
 ---
 
 ## Notes

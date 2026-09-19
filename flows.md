@@ -74,9 +74,9 @@ the same file, called in this order:
 ## Flow 5 — Background summary (`src/compression.py`, `src/summarize.py`)
 
 `_check_and_generate_summary_async` (`src/compression.py`):
-1. `_resolve_context_tokens` against `compression_threshold_tokens`.
-2. Emit context-usage status via `_emit_context_usage_status`.
-3. If `current_tokens >= compression_threshold_tokens` → `_generate_summary_async`, else log "not reached".
+1. `_resolve_context_tokens` against the resolved `compression_threshold_tokens` (a percentage of the resolved max context — see cross-cutting notes).
+2. Emit context-usage status via `_emit_context_usage_status` (history-only label + "drives compaction" note).
+3. If `compression_threshold_tokens > 0` and `current_tokens >= compression_threshold_tokens` → `_generate_summary_async`, else log "not reached" (threshold 0 = max context unknown, never trigger on the threshold alone).
 
 `_generate_summary_async` (`src/summarize.py`) — orchestration only; the heavy
 sections are extracted helpers in the same file:
@@ -118,7 +118,8 @@ sections are extracted helpers in the same file:
 
 ## Cross-cutting observations
 
-- **Every flow funnels through `_get_model_thresholds`** for limits, and through `_get_summary_model_context_limit` for summary budget — both resolve per-model overrides → base-model → global valve.
+- **Every flow funnels through `_get_model_thresholds`** for limits, and through `_get_summary_model_context_limit` for summary budget. Resolution chain: per-model `model_thresholds` override (absolute, wins; direct or via base_model_id) → **model-reported context length** (`_resolve_reported_context_length`, `src/contextlength.py` — API-type-dispatched resolver registry, `openai_api` reads `meta.context_length` then `meta.n_ctx`, flattened or nested under `meta`, as stored by Open WebUI from the API payload) → global `max_context_tokens` valve fallback. The compression threshold is `compression_threshold_percent` (default 80) of the resolved max context — the old absolute `compression_threshold_tokens` valve is gone.
+- **`_emit_context_usage_status` labels** (Phase 4.6): `label_key` distinguishes full-request counts ("Context Usage" — inlet branches, post-summary) from history-only counts ("History Usage" — outlet), and `note_key` marks the outlet reading as the one that drives compaction.
 - **The "atomic group" concept is the load-bearing invariant**: `_get_atomic_groups` is used by trimming, boundary alignment, budget-shrinking in both inlet branches, and in the background shrink loop. Keeping tool-call chains intact is the plugin's core correctness property.
 - **Two coordinate systems** are maintained deliberately: *visible message indices* (inlet/outlet) vs *original-history count* (`compressed_message_count` / `covered_until`), bridged by `_get_summary_view_state` / `_get_original_history_count` / `_calculate_target_compressed_count`.
 - **Shared status/token helpers** (Phase 2): `_emit_context_usage_status`, `_resolve_context_tokens`, `_extract_system_from_params`, `_drop_oldest_atomic_group` — one definition each, all call sites converted.

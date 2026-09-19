@@ -21,6 +21,7 @@ MODULES = [
     "i18n",
     "tokens",
     "db",
+    "contextlength",
     "toolcalls",
     "compression",
     "summarize",

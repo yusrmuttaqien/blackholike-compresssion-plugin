@@ -2,6 +2,11 @@
 # Fragment: relies on shared imports/constants from _header.py.
 # Not importable standalone — assembled into v1.6.1.py by build.py.
 
+# Rate limiting for the background context-length self-heal task:
+# at most one live re-query per model per interval.
+_context_heal_last_checked: Dict[str, float] = {}
+_CONTEXT_HEAL_INTERVAL_SECONDS = 300
+
 
 class CompressionMixin:
 
@@ -450,6 +455,66 @@ class CompressionMixin:
             return self.valves.summary_model_max_context
 
         return thresholds.get("max_context_tokens", self.valves.max_context_tokens)
+
+    async def _self_heal_context_length(self, model_id: str) -> None:
+        """Background self-heal for stale context-length snapshots.
+
+        Open WebUI copies the /v1/models payload into the model's meta at
+        import time, so a server restarted with a different slot context
+        leaves a stale value behind. Re-query the enabled OpenAI-compatible
+        connections and rewrite meta.context_length when the server reports
+        a different value. Rate-limited per model; all failures are
+        swallowed (a background task must never surface an error).
+        """
+        try:
+            if _detect_api_type(model_id) != "openai_api":
+                return
+
+            now = time.time()
+            last = _context_heal_last_checked.get(model_id)
+            if last is not None and now - last < _CONTEXT_HEAL_INTERVAL_SECONDS:
+                return
+            _context_heal_last_checked[model_id] = now
+
+            row = await _call_db(Models.get_model_by_id, model_id)
+            if row is None:
+                return
+
+            connections = _get_openai_connections()
+            if not connections:
+                return
+
+            model_name = model_id.split("/", 1)[1] if "/" in model_id else model_id
+            live_value = await _live_query_context_length(connections, model_name)
+            if live_value is None:
+                return
+
+            stored_value = _resolve_reported_context_length(model_id, row)
+            if stored_value == live_value:
+                return
+
+            from open_webui.models.models import ModelForm
+
+            new_meta = _meta_to_dict(row.meta)
+            if new_meta is None:
+                new_meta = {}
+            new_meta["context_length"] = live_value
+            form = ModelForm(
+                id=model_id,
+                base_model_id=row.base_model_id,
+                name=row.name,
+                meta=new_meta,
+                params=row.params,
+                is_active=row.is_active,
+            )
+            await _call_db(Models.update_model_by_id, model_id, form)
+            await self._log(
+                f"[SelfHeal] 🔄 Stored context length for '{model_id}' "
+                f"updated: {stored_value} -> {live_value}"
+            )
+        except Exception as e:
+            if self.valves.debug_mode:
+                logger.info(f"[SelfHeal] {model_id}: {e}")
 
     def _extract_system_from_params(self, params: Any) -> Optional[str]:
         """Extract the 'system' prompt from model params (dict, JSON string, or object)."""

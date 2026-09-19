@@ -13,6 +13,19 @@
 #   2. Register it in _CONTEXT_LENGTH_RESOLVERS under the API type name.
 
 
+def _meta_to_dict(meta) -> Optional[Dict[str, Any]]:
+    """Normalize a model meta payload (plain dict or pydantic model)."""
+    if isinstance(meta, dict):
+        return meta
+    dump = getattr(meta, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump()
+        except Exception:
+            return None
+    return None
+
+
 def _resolve_context_length_openai_api(model_id, model_obj) -> Optional[int]:
     """OpenAI-compatible: Open WebUI stores the /v1/models payload in meta.
 
@@ -25,6 +38,7 @@ def _resolve_context_length_openai_api(model_id, model_obj) -> Optional[int]:
     """
 
     def _pick(source):
+        source = _meta_to_dict(source)
         if not isinstance(source, dict):
             return None
         for key in ("context_length", "n_ctx"):
@@ -37,7 +51,7 @@ def _resolve_context_length_openai_api(model_id, model_obj) -> Optional[int]:
                 return int(value)
         return None
 
-    meta = getattr(model_obj, "meta", None)
+    meta = _meta_to_dict(getattr(model_obj, "meta", None))
     nested = meta.get("meta") if isinstance(meta, dict) else None
     return _pick(meta) or _pick(nested)
 
@@ -97,3 +111,99 @@ def _resolve_reported_context_length(model_id: str, model_obj) -> Optional[int]:
         return resolver(model_id, model_obj)
     except Exception:
         return None
+
+
+async def _live_query_context_length(connections, model_name: str) -> Optional[int]:
+    """Query /v1/models on each (base_url, api_key) connection.
+
+    Returns the context length reported for model_name (context_length
+    or n_ctx), or None when the model is not found on any server, the
+    matched entry reports no value, or httpx is unavailable.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    for base_url, api_key in connections:
+        try:
+            headers = {}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(
+                    f"{str(base_url).rstrip('/')}/v1/models", headers=headers
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+        except Exception:
+            continue
+
+        for entry in payload.get("data", []):
+            if not isinstance(entry, dict) or entry.get("id") != model_name:
+                continue
+            nested = (
+                entry.get("meta")
+                if isinstance(entry.get("meta"), dict)
+                else {}
+            )
+            value = (
+                entry.get("context_length")
+                or entry.get("n_ctx")
+                or nested.get("context_length")
+                or nested.get("n_ctx")
+            )
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and value > 0
+            ):
+                return int(value)
+            return None
+    return None
+
+
+def _get_openai_connections() -> List[tuple]:
+    """Enabled OpenAI-compatible connections from the Open WebUI config table.
+
+    Reads openai.api_base_urls / openai.api_keys / openai.api_configs and
+    returns (base_url, api_key) pairs for enabled entries, in config
+    order. Returns [] when the config table is unreadable.
+    """
+    if owui_engine is None:
+        return []
+    try:
+        from sqlalchemy import text
+
+        with owui_engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT key, value FROM config WHERE key IN "
+                    "('openai.api_base_urls', 'openai.api_keys', 'openai.api_configs')"
+                )
+            ).fetchall()
+    except Exception:
+        return []
+
+    values = {key: value for key, value in rows}
+    try:
+        base_urls = json.loads(values.get("openai.api_base_urls") or "[]")
+        api_keys = json.loads(values.get("openai.api_keys") or "[]")
+        api_configs = json.loads(values.get("openai.api_configs") or "{}")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(base_urls, list):
+        return []
+    if not isinstance(api_keys, list):
+        api_keys = []
+    if not isinstance(api_configs, dict):
+        api_configs = {}
+
+    connections = []
+    for i, base_url in enumerate(base_urls):
+        config = api_configs.get(str(i))
+        if isinstance(config, dict) and not config.get("enable", True):
+            continue
+        key = api_keys[i] if i < len(api_keys) else ""
+        connections.append((base_url, key if isinstance(key, str) else ""))
+    return connections

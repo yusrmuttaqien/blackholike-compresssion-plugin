@@ -48,6 +48,10 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             default="",
             description="Per-model overrides (highest priority). Format: model_id:compression_threshold:max_context (comma-separated). Absolute token counts; win over model-reported values and global settings. Example: gpt-4:8000:32000, claude-3:100000:200000",
         )
+        self_heal_context_length: bool = Field(
+            default=True,
+            description="Background self-heal: re-query the model's live API for its current context length and update the stored value if it changed (e.g. after a llama.cpp restart with a different slot context). Runs at most once every 5 minutes per model.",
+        )
 
         keep_first: int = Field(
             default=0,
@@ -630,6 +634,14 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                     "[Inlet] Skipping compression: copilot_sdk detected in base model"
                 )
             return body
+
+        # --- Background context-length self-heal (stale snapshot fix) ---
+        if self.valves.self_heal_context_length:
+            heal_model_id = body.get("model")
+            if heal_model_id:
+                asyncio.create_task(
+                    self._self_heal_context_length(heal_model_id)
+                )
 
         messages = body.get("messages", [])
         user_ctx = await self._get_user_context(__user__, __event_call__)

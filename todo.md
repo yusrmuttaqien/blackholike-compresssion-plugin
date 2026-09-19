@@ -229,10 +229,36 @@ that report a small context (e.g. llama.cpp at 4k) now trigger the summary
 path at 3.2k instead of never; users who had set an absolute threshold
 should move it to `model_thresholds` per-model overrides.
 
-**Known limitation:** the stored `n_ctx` is a snapshot from when the model
-was imported into Open WebUI. Restarting llama.cpp with a different slot
-context size (`-c`) won't update it until the model is re-imported — a
-live `/v1/models` query would fix that (deferred, see decision 3).
+- [x] 5.7 **Self-healing context length** (the deferred live query): the
+      stored meta is a snapshot from import time, so a llama.cpp restart
+      with a different slot context (`-c`) leaves a stale value. New:
+      - `src/contextlength.py`: `_meta_to_dict` (normalizes dict / pydantic
+        ModelMeta — in production 0.11.3 `row.meta` is a pydantic object,
+        which the old `isinstance(meta, dict)` check missed),
+        `_live_query_context_length` (httpx lazy import, 3s timeout,
+        `GET /v1/models`, match by model id, reads `context_length` / `n_ctx`
+        at entry top level and nested `meta`), `_get_openai_connections`
+        (reads `openai.api_base_urls` / `openai.api_keys` /
+        `openai.api_configs` from the config table via `owui_engine`,
+        enabled entries only, in config order).
+      - `src/compression.py`: `_self_heal_context_length(model_id)` —
+        openai_api-type only, rate-limited to one live re-query per model
+        per 5 minutes (`_context_heal_last_checked`), rewrites
+        `meta.context_length` via `Models.update_model_by_id` with a full
+        read-modify-write form (name / params / base_model_id / is_active
+        preserved; ModelForm dumps the whole row, so a partial form would
+        clobber other fields), all exceptions swallowed (background task).
+      - `src/filter.py`: valve `self_heal_context_length` (default true);
+        inlet spawns the task via `asyncio.create_task` after the skip
+        check.
+      Verified: 13/13 smoke test (pydantic-meta resolver, enabled-only
+      connections, nested `n_ctx` live match, end-to-end update with row
+      preservation, rate limit, no-op on match, non-openai skip) + 14/14
+      threshold suite re-run.
+
+**Note:** the old "known limitation" (stale snapshot) is resolved by 5.7 —
+the stored value self-corrects within 5 minutes of the next chat turn on
+the affected model.
 
 ---
 

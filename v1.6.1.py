@@ -756,6 +756,19 @@ class DBMixin:
 #   2. Register it in _CONTEXT_LENGTH_RESOLVERS under the API type name.
 
 
+def _meta_to_dict(meta) -> Optional[Dict[str, Any]]:
+    """Normalize a model meta payload (plain dict or pydantic model)."""
+    if isinstance(meta, dict):
+        return meta
+    dump = getattr(meta, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump()
+        except Exception:
+            return None
+    return None
+
+
 def _resolve_context_length_openai_api(model_id, model_obj) -> Optional[int]:
     """OpenAI-compatible: Open WebUI stores the /v1/models payload in meta.
 
@@ -768,6 +781,7 @@ def _resolve_context_length_openai_api(model_id, model_obj) -> Optional[int]:
     """
 
     def _pick(source):
+        source = _meta_to_dict(source)
         if not isinstance(source, dict):
             return None
         for key in ("context_length", "n_ctx"):
@@ -780,7 +794,7 @@ def _resolve_context_length_openai_api(model_id, model_obj) -> Optional[int]:
                 return int(value)
         return None
 
-    meta = getattr(model_obj, "meta", None)
+    meta = _meta_to_dict(getattr(model_obj, "meta", None))
     nested = meta.get("meta") if isinstance(meta, dict) else None
     return _pick(meta) or _pick(nested)
 
@@ -840,6 +854,102 @@ def _resolve_reported_context_length(model_id: str, model_obj) -> Optional[int]:
         return resolver(model_id, model_obj)
     except Exception:
         return None
+
+
+async def _live_query_context_length(connections, model_name: str) -> Optional[int]:
+    """Query /v1/models on each (base_url, api_key) connection.
+
+    Returns the context length reported for model_name (context_length
+    or n_ctx), or None when the model is not found on any server, the
+    matched entry reports no value, or httpx is unavailable.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    for base_url, api_key in connections:
+        try:
+            headers = {}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(
+                    f"{str(base_url).rstrip('/')}/v1/models", headers=headers
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+        except Exception:
+            continue
+
+        for entry in payload.get("data", []):
+            if not isinstance(entry, dict) or entry.get("id") != model_name:
+                continue
+            nested = (
+                entry.get("meta")
+                if isinstance(entry.get("meta"), dict)
+                else {}
+            )
+            value = (
+                entry.get("context_length")
+                or entry.get("n_ctx")
+                or nested.get("context_length")
+                or nested.get("n_ctx")
+            )
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and value > 0
+            ):
+                return int(value)
+            return None
+    return None
+
+
+def _get_openai_connections() -> List[tuple]:
+    """Enabled OpenAI-compatible connections from the Open WebUI config table.
+
+    Reads openai.api_base_urls / openai.api_keys / openai.api_configs and
+    returns (base_url, api_key) pairs for enabled entries, in config
+    order. Returns [] when the config table is unreadable.
+    """
+    if owui_engine is None:
+        return []
+    try:
+        from sqlalchemy import text
+
+        with owui_engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT key, value FROM config WHERE key IN "
+                    "('openai.api_base_urls', 'openai.api_keys', 'openai.api_configs')"
+                )
+            ).fetchall()
+    except Exception:
+        return []
+
+    values = {key: value for key, value in rows}
+    try:
+        base_urls = json.loads(values.get("openai.api_base_urls") or "[]")
+        api_keys = json.loads(values.get("openai.api_keys") or "[]")
+        api_configs = json.loads(values.get("openai.api_configs") or "{}")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(base_urls, list):
+        return []
+    if not isinstance(api_keys, list):
+        api_keys = []
+    if not isinstance(api_configs, dict):
+        api_configs = {}
+
+    connections = []
+    for i, base_url in enumerate(base_urls):
+        config = api_configs.get(str(i))
+        if isinstance(config, dict) and not config.get("enable", True):
+            continue
+        key = api_keys[i] if i < len(api_keys) else ""
+        connections.append((base_url, key if isinstance(key, str) else ""))
+    return connections
 
 # ── toolcalls.py · Native tool-call normalization, trimming, atomic grouping 
 # Fragment: relies on shared imports/constants from _header.py.
@@ -1239,6 +1349,11 @@ class ToolCallMixin:
 # ── compression.py · History reconstruction, thresholds, compression orchestration 
 # Fragment: relies on shared imports/constants from _header.py.
 # Not importable standalone — assembled into v1.6.1.py by build.py.
+
+# Rate limiting for the background context-length self-heal task:
+# at most one live re-query per model per interval.
+_context_heal_last_checked: Dict[str, float] = {}
+_CONTEXT_HEAL_INTERVAL_SECONDS = 300
 
 
 class CompressionMixin:
@@ -1688,6 +1803,66 @@ class CompressionMixin:
             return self.valves.summary_model_max_context
 
         return thresholds.get("max_context_tokens", self.valves.max_context_tokens)
+
+    async def _self_heal_context_length(self, model_id: str) -> None:
+        """Background self-heal for stale context-length snapshots.
+
+        Open WebUI copies the /v1/models payload into the model's meta at
+        import time, so a server restarted with a different slot context
+        leaves a stale value behind. Re-query the enabled OpenAI-compatible
+        connections and rewrite meta.context_length when the server reports
+        a different value. Rate-limited per model; all failures are
+        swallowed (a background task must never surface an error).
+        """
+        try:
+            if _detect_api_type(model_id) != "openai_api":
+                return
+
+            now = time.time()
+            last = _context_heal_last_checked.get(model_id)
+            if last is not None and now - last < _CONTEXT_HEAL_INTERVAL_SECONDS:
+                return
+            _context_heal_last_checked[model_id] = now
+
+            row = await _call_db(Models.get_model_by_id, model_id)
+            if row is None:
+                return
+
+            connections = _get_openai_connections()
+            if not connections:
+                return
+
+            model_name = model_id.split("/", 1)[1] if "/" in model_id else model_id
+            live_value = await _live_query_context_length(connections, model_name)
+            if live_value is None:
+                return
+
+            stored_value = _resolve_reported_context_length(model_id, row)
+            if stored_value == live_value:
+                return
+
+            from open_webui.models.models import ModelForm
+
+            new_meta = _meta_to_dict(row.meta)
+            if new_meta is None:
+                new_meta = {}
+            new_meta["context_length"] = live_value
+            form = ModelForm(
+                id=model_id,
+                base_model_id=row.base_model_id,
+                name=row.name,
+                meta=new_meta,
+                params=row.params,
+                is_active=row.is_active,
+            )
+            await _call_db(Models.update_model_by_id, model_id, form)
+            await self._log(
+                f"[SelfHeal] 🔄 Stored context length for '{model_id}' "
+                f"updated: {stored_value} -> {live_value}"
+            )
+        except Exception as e:
+            if self.valves.debug_mode:
+                logger.info(f"[SelfHeal] {model_id}: {e}")
 
     def _extract_system_from_params(self, params: Any) -> Optional[str]:
         """Extract the 'system' prompt from model params (dict, JSON string, or object)."""
@@ -3311,6 +3486,10 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             default="",
             description="Per-model overrides (highest priority). Format: model_id:compression_threshold:max_context (comma-separated). Absolute token counts; win over model-reported values and global settings. Example: gpt-4:8000:32000, claude-3:100000:200000",
         )
+        self_heal_context_length: bool = Field(
+            default=True,
+            description="Background self-heal: re-query the model's live API for its current context length and update the stored value if it changed (e.g. after a llama.cpp restart with a different slot context). Runs at most once every 5 minutes per model.",
+        )
 
         keep_first: int = Field(
             default=0,
@@ -3893,6 +4072,14 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
                     "[Inlet] Skipping compression: copilot_sdk detected in base model"
                 )
             return body
+
+        # --- Background context-length self-heal (stale snapshot fix) ---
+        if self.valves.self_heal_context_length:
+            heal_model_id = body.get("model")
+            if heal_model_id:
+                asyncio.create_task(
+                    self._self_heal_context_length(heal_model_id)
+                )
 
         messages = body.get("messages", [])
         user_ctx = await self._get_user_context(__user__, __event_call__)

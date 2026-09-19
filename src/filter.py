@@ -50,7 +50,7 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
         )
         self_heal_context_length: bool = Field(
             default=True,
-            description="Background self-heal: re-query the model's live API for its current context length and update the stored value if it changed (e.g. after a llama.cpp restart with a different slot context). Runs at most once every 5 minutes per model.",
+            description="Background self-heal: re-query the model's live API for its current context length and update the stored value if it changed (e.g. after a llama.cpp restart with a different slot context). The first turn of a new chat always checks; other turns at most once every 5 minutes per model.",
         )
 
         keep_first: int = Field(
@@ -640,7 +640,9 @@ class Filter(I18nMixin, TokenMixin, DBMixin, ToolCallMixin, CompressionMixin,
             heal_model_id = body.get("model")
             if heal_model_id:
                 asyncio.create_task(
-                    self._self_heal_context_length(heal_model_id)
+                    self._self_heal_context_length(
+                        heal_model_id, body.get("chat_id", "")
+                    )
                 )
 
         messages = body.get("messages", [])

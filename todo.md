@@ -241,9 +241,12 @@ should move it to `model_thresholds` per-model overrides.
         (reads `openai.api_base_urls` / `openai.api_keys` /
         `openai.api_configs` from the config table via `owui_engine`,
         enabled entries only, in config order).
-      - `src/compression.py`: `_self_heal_context_length(model_id)` —
-        openai_api-type only, rate-limited to one live re-query per model
-        per 5 minutes (`_context_heal_last_checked`), rewrites
+      - `src/compression.py`: `_self_heal_context_length(model_id,
+        chat_id)` — openai_api-type only; **the first turn of a new chat
+        always checks** (catches server restarts between chats; tracked in
+        bounded `_context_heal_checked_chats`, 128 max), other turns
+        rate-limited to one live re-query per model per 5 minutes
+        (`_context_heal_last_checked`); rewrites
         `meta.context_length` via `Models.update_model_by_id` with a full
         read-modify-write form (name / params / base_model_id / is_active
         preserved; ModelForm dumps the whole row, so a partial form would
@@ -251,10 +254,11 @@ should move it to `model_thresholds` per-model overrides.
       - `src/filter.py`: valve `self_heal_context_length` (default true);
         inlet spawns the task via `asyncio.create_task` after the skip
         check.
-      Verified: 13/13 smoke test (pydantic-meta resolver, enabled-only
+      Verified: 18/18 smoke test (pydantic-meta resolver, enabled-only
       connections, nested `n_ctx` live match, end-to-end update with row
-      preservation, rate limit, no-op on match, non-openai skip) + 14/14
-      threshold suite re-run.
+      preservation, rate limit, no-op on match, non-openai skip, new-chat
+      bypass, same-chat rate limit, chat-map bound) + 14/14 threshold
+      suite re-run.
 
 **Note:** the old "known limitation" (stale snapshot) is resolved by 5.7 —
 the stored value self-corrects within 5 minutes of the next chat turn on

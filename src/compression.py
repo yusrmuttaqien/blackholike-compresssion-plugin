@@ -3,9 +3,13 @@
 # Not importable standalone — assembled into v1.6.1.py by build.py.
 
 # Rate limiting for the background context-length self-heal task:
-# at most one live re-query per model per interval.
+# at most one live re-query per model per interval, EXCEPT the first
+# turn of a new chat always checks (catches server restarts between
+# chats). Both maps are bounded; eviction drops the oldest entry.
 _context_heal_last_checked: Dict[str, float] = {}
+_context_heal_checked_chats: Dict[str, bool] = {}
 _CONTEXT_HEAL_INTERVAL_SECONDS = 300
+_CONTEXT_HEAL_MAX_TRACKED = 128
 
 
 class CompressionMixin:
@@ -456,25 +460,41 @@ class CompressionMixin:
 
         return thresholds.get("max_context_tokens", self.valves.max_context_tokens)
 
-    async def _self_heal_context_length(self, model_id: str) -> None:
+    async def _self_heal_context_length(
+        self, model_id: str, chat_id: str = ""
+    ) -> None:
         """Background self-heal for stale context-length snapshots.
 
         Open WebUI copies the /v1/models payload into the model's meta at
         import time, so a server restarted with a different slot context
         leaves a stale value behind. Re-query the enabled OpenAI-compatible
         connections and rewrite meta.context_length when the server reports
-        a different value. Rate-limited per model; all failures are
-        swallowed (a background task must never surface an error).
+        a different value. The first turn of a new chat always checks (catches
+        server restarts between chats); other turns are rate-limited per
+        model. All failures are swallowed (a background task must never
+        surface an error).
         """
         try:
             if _detect_api_type(model_id) != "openai_api":
                 return
 
-            now = time.time()
-            last = _context_heal_last_checked.get(model_id)
-            if last is not None and now - last < _CONTEXT_HEAL_INTERVAL_SECONDS:
-                return
-            _context_heal_last_checked[model_id] = now
+            new_chat = False
+            if chat_id:
+                if chat_id not in _context_heal_checked_chats:
+                    new_chat = True
+                    _context_heal_checked_chats[chat_id] = True
+                    while len(_context_heal_checked_chats) > _CONTEXT_HEAL_MAX_TRACKED:
+                        _context_heal_checked_chats.pop(
+                            next(iter(_context_heal_checked_chats))
+                        )
+
+            if not new_chat:
+                now = time.time()
+                last = _context_heal_last_checked.get(model_id)
+                if last is not None and now - last < _CONTEXT_HEAL_INTERVAL_SECONDS:
+                    return
+
+            _context_heal_last_checked[model_id] = time.time()
 
             row = await _call_db(Models.get_model_by_id, model_id)
             if row is None:
